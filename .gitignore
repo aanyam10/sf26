@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# OS/editor
+.DS_Store
+
+# Runtime outputs
+outputs/
+
+# Optional local model cache (uncomment to avoid committing model files)
+# model_cache/
