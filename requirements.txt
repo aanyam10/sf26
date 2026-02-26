@@ -1,8 +1,8 @@
-streamlit
-numpy
-pydicom
-scipy
-tensorflow
-pandas
-matplotlib
-pillow
+streamlit==1.39.0
+numpy==1.26.4
+pydicom==2.4.4
+scipy==1.11.4
+tensorflow==2.15.1
+pandas==2.1.4
+matplotlib==3.8.4
+pillow==10.4.0

@@ -19,6 +19,7 @@ This app takes one uploaded cancer DICOM case, runs two pipelines (`before` and 
 
 - `app.py`: Streamlit app + pipeline execution.
 - `requirements.txt`: runtime dependencies.
+- `runtime.txt`: Streamlit Cloud Python runtime pin (`python-3.11`).
 - `.streamlit/config.toml`: Streamlit runtime settings.
 - `.github/workflows/ci.yml`: lightweight CI checks.
 - `.gitattributes`: Git LFS tracking for `.keras` model files.
