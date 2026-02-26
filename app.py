@@ -16,7 +16,6 @@ import numpy as np
 import pandas as pd
 import pydicom
 import streamlit as st
-import tensorflow as tf
 from matplotlib import animation, pyplot as plt
 from scipy import ndimage
 
@@ -29,7 +28,22 @@ from scipy import ndimage
 def seed_everything(seed: int = 42) -> None:
     random.seed(seed)
     np.random.seed(seed)
-    tf.random.set_seed(seed)
+    try:
+        tf = get_tf()
+        tf.random.set_seed(seed)
+    except Exception:
+        # BEFORE flow can run without TensorFlow.
+        pass
+
+
+def get_tf():
+    try:
+        import tensorflow as tf
+    except Exception as e:
+        raise RuntimeError(
+            "TensorFlow could not be imported. Ensure `tensorflow` is installed in the deployment environment."
+        ) from e
+    return tf
 
 
 def get_sorted_dicom_files(folder: str) -> List[str]:
@@ -591,6 +605,7 @@ def robust_positive_z(arr: np.ndarray, valid: np.ndarray) -> np.ndarray:
 
 
 def build_ae(shape: Tuple[int, int, int] = (160, 160, 1), lr: float = 1e-3):
+    tf = get_tf()
     i = tf.keras.layers.Input(shape=shape)
     x = tf.keras.layers.Conv2D(16, 3, strides=2, padding="same", activation="relu")(i)
     x = tf.keras.layers.Conv2D(32, 3, strides=2, padding="same", activation="relu")(x)
@@ -641,6 +656,7 @@ def max_lung_width_px(mask3d: np.ndarray) -> int:
 
 @st.cache_resource(show_spinner=False)
 def load_model_cached(path: str):
+    tf = get_tf()
     return tf.keras.models.load_model(path, compile=False)
 
 
@@ -650,6 +666,7 @@ def load_or_train_after_model(
     model_path: str,
     force_retrain: bool = False,
 ):
+    tf = get_tf()
     if not healthy_ae:
         raise RuntimeError("No healthy slices available to train/load AFTER model.")
 
