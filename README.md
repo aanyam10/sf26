@@ -35,11 +35,14 @@ streamlit run app.py
 
 ## Usage
 
-1. Set healthy folder paths in the sidebar (`trial1`, `trial2`, `trial3`).
+1. In sidebar, choose healthy input mode:
+   - `Upload healthy DICOM files` (recommended for Streamlit Cloud), or
+   - `Local folder paths` (for local runs on your machine).
 2. Upload one cancer case (DICOM files or zip).
-3. Keep cached model path as `model_cache/after_ae_model.keras`.
-4. Leave `Force retrain AFTER model` unchecked for reuse.
-5. Click **Run Comparison**.
+3. If using upload mode, upload healthy trials for `trial1`, `trial2`, `trial3` in the Run tab.
+4. Keep cached model path as `model_cache/after_ae_model.keras`.
+5. Leave `Force retrain AFTER model` unchecked for reuse.
+6. Click **Run Comparison**.
 
 First run:
 - trains and saves `model_cache/after_ae_model.keras`.

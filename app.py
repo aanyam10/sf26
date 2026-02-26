@@ -159,7 +159,7 @@ def as_py(v):
     return v
 
 
-def save_uploaded_cancer_files(uploaded_files: List[st.runtime.uploaded_file_manager.UploadedFile], dest_root: str) -> str:
+def save_uploaded_files(uploaded_files: List[st.runtime.uploaded_file_manager.UploadedFile], dest_root: str) -> str:
     if os.path.isdir(dest_root):
         shutil.rmtree(dest_root)
     os.makedirs(dest_root, exist_ok=True)
@@ -196,11 +196,17 @@ def save_uploaded_cancer_files(uploaded_files: List[st.runtime.uploaded_file_man
     return best_dir
 
 
+def save_uploaded_cancer_files(uploaded_files: List[st.runtime.uploaded_file_manager.UploadedFile], dest_root: str) -> str:
+    return save_uploaded_files(uploaded_files, dest_root)
+
+
 def parse_paths(text: str) -> List[str]:
     return [line.strip() for line in text.splitlines() if line.strip()]
 
 
 def validate_healthy_paths(paths: List[str], label: str) -> None:
+    if not paths:
+        raise ValueError(f"{label} requires at least one healthy folder path.")
     for p in paths:
         if not os.path.isdir(p):
             raise FileNotFoundError(f"{label} path missing: {p}")
@@ -849,17 +855,31 @@ def main() -> None:
     st.caption("Upload one cancer case once, run both pipelines, and compare GIFs side by side.")
 
     with st.sidebar:
-        st.subheader("Paths")
-        before_paths_raw = st.text_area(
-            "BEFORE healthy folders (one per line)",
-            value="/content/trial1\n/content/trial2\n/content/trial3",
-            height=100,
+        st.subheader("Healthy Data Source")
+        healthy_input_mode = st.radio(
+            "How should healthy reference data be provided?",
+            options=["Upload healthy DICOM files", "Local folder paths"],
+            index=0,
         )
-        after_paths_raw = st.text_area(
-            "AFTER healthy folders (one per line)",
-            value="/content/trial1\n/content/trial2\n/content/trial3",
-            height=100,
-        )
+
+        before_paths_raw = ""
+        after_paths_raw = ""
+        if healthy_input_mode == "Local folder paths":
+            st.subheader("Healthy Paths")
+            before_paths_raw = st.text_area(
+                "BEFORE healthy folders (one per line)",
+                value="/path/to/trial1\n/path/to/trial2\n/path/to/trial3",
+                height=110,
+            )
+            after_paths_raw = st.text_area(
+                "AFTER healthy folders (one per line)",
+                value="/path/to/trial1\n/path/to/trial2\n/path/to/trial3",
+                height=110,
+            )
+        else:
+            st.caption("Use the Run tab to upload healthy trial files for trial1/trial2/trial3.")
+
+        st.subheader("Run Settings")
         output_root = st.text_input("Output root", value="outputs")
         model_path = st.text_input("Cached AFTER model path", value="model_cache/after_ae_model.keras")
         force_retrain = st.checkbox("Force retrain AFTER model", value=False)
@@ -902,6 +922,55 @@ def main() -> None:
             key="cancer_uploads",
         )
 
+        before_trial_uploads = []
+        after_trial_uploads = []
+        reuse_before_for_after = True
+        if healthy_input_mode == "Upload healthy DICOM files":
+            st.markdown("#### Upload Healthy Reference Trials")
+            st.caption("Upload each trial as DICOM files and/or a ZIP archive.")
+            before_trial_uploads = [
+                st.file_uploader(
+                    "BEFORE trial1",
+                    accept_multiple_files=True,
+                    key="before_trial1_uploads",
+                ),
+                st.file_uploader(
+                    "BEFORE trial2",
+                    accept_multiple_files=True,
+                    key="before_trial2_uploads",
+                ),
+                st.file_uploader(
+                    "BEFORE trial3",
+                    accept_multiple_files=True,
+                    key="before_trial3_uploads",
+                ),
+            ]
+            reuse_before_for_after = st.checkbox(
+                "Use the same healthy uploads for AFTER",
+                value=True,
+                key="reuse_before_uploads_for_after",
+            )
+            if not reuse_before_for_after:
+                after_trial_uploads = [
+                    st.file_uploader(
+                        "AFTER trial1",
+                        accept_multiple_files=True,
+                        key="after_trial1_uploads",
+                    ),
+                    st.file_uploader(
+                        "AFTER trial2",
+                        accept_multiple_files=True,
+                        key="after_trial2_uploads",
+                    ),
+                    st.file_uploader(
+                        "AFTER trial3",
+                        accept_multiple_files=True,
+                        key="after_trial3_uploads",
+                    ),
+                ]
+        else:
+            st.caption("Using local healthy paths configured in the sidebar.")
+
         if not run_btn:
             st.info("Set paths and upload files, then click Run Comparison.")
             return
@@ -912,16 +981,6 @@ def main() -> None:
 
         seed_everything(42)
 
-        before_paths = parse_paths(before_paths_raw)
-        after_paths = parse_paths(after_paths_raw)
-
-        try:
-            validate_healthy_paths(before_paths, "BEFORE")
-            validate_healthy_paths(after_paths, "AFTER")
-        except Exception as e:
-            st.error(str(e))
-            return
-
         run_id = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
         run_dir = os.path.join(output_root, run_id)
         before_dir = os.path.join(run_dir, "before")
@@ -929,11 +988,48 @@ def main() -> None:
         upload_dir = os.path.join(run_dir, "uploaded_cancer")
         os.makedirs(run_dir, exist_ok=True)
 
+        before_paths: List[str] = []
+        after_paths: List[str] = []
+
+        if healthy_input_mode == "Local folder paths":
+            before_paths = parse_paths(before_paths_raw)
+            after_paths = parse_paths(after_paths_raw)
+            try:
+                validate_healthy_paths(before_paths, "BEFORE")
+                validate_healthy_paths(after_paths, "AFTER")
+            except Exception as e:
+                st.error(str(e))
+                return
+        else:
+            if any(len(files) == 0 for files in before_trial_uploads):
+                st.error("Please upload healthy files for BEFORE trial1, trial2, and trial3.")
+                return
+            if not reuse_before_for_after and any(len(files) == 0 for files in after_trial_uploads):
+                st.error("Please upload healthy files for AFTER trial1, trial2, and trial3.")
+                return
+
         with st.status("Running pipelines...", expanded=True) as status:
             try:
-                st.write("Saving uploaded files...")
-                cancer_path = save_uploaded_cancer_files(uploads, upload_dir)
+                st.write("Saving cancer uploads...")
+                cancer_path = save_uploaded_files(uploads, upload_dir)
                 st.write(f"Cancer input folder: `{cancer_path}`")
+
+                if healthy_input_mode == "Upload healthy DICOM files":
+                    healthy_root = os.path.join(run_dir, "uploaded_healthy")
+                    before_paths = []
+                    for i, files in enumerate(before_trial_uploads, start=1):
+                        st.write(f"Saving BEFORE trial{i} uploads...")
+                        trial_dir = os.path.join(healthy_root, "before", f"trial{i}")
+                        before_paths.append(save_uploaded_files(files, trial_dir))
+
+                    if reuse_before_for_after:
+                        after_paths = before_paths.copy()
+                    else:
+                        after_paths = []
+                        for i, files in enumerate(after_trial_uploads, start=1):
+                            st.write(f"Saving AFTER trial{i} uploads...")
+                            trial_dir = os.path.join(healthy_root, "after", f"trial{i}")
+                            after_paths.append(save_uploaded_files(files, trial_dir))
 
                 st.write("Running BEFORE...")
                 before = run_before(
@@ -971,6 +1067,9 @@ def main() -> None:
             "run_id": run_id,
             "timestamp_utc": datetime.utcnow().isoformat() + "Z",
             "cancer_path": cancer_path,
+            "healthy_input_mode": healthy_input_mode,
+            "before_healthy_paths": before_paths,
+            "after_healthy_paths": after_paths,
             "before": before,
             "after": after,
             "comparison_metrics": cmp_df.reset_index().to_dict(orient="records"),
