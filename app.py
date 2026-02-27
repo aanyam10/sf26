@@ -218,6 +218,16 @@ def parse_paths(text: str) -> List[str]:
     return [line.strip() for line in text.splitlines() if line.strip()]
 
 
+def evenly_spaced_indices(total: int, limit: int) -> List[int]:
+    if limit <= 0 or total <= limit:
+        return list(range(total))
+    idx = np.linspace(0, total - 1, num=limit)
+    idx = np.round(idx).astype(int)
+    idx = np.clip(idx, 0, total - 1)
+    # Preserve order but remove duplicates from rounding.
+    return list(dict.fromkeys(idx.tolist()))
+
+
 def validate_healthy_paths(paths: List[str], label: str) -> None:
     if not paths:
         raise ValueError(f"{label} requires at least one healthy folder path.")
@@ -482,6 +492,7 @@ def run_before(
     fps: int,
     frame_stride: int,
     max_gif_frames: int,
+    max_slices: int,
 ) -> Dict[str, object]:
     os.makedirs(out_dir, exist_ok=True)
     t0 = time.time()
@@ -493,6 +504,13 @@ def run_before(
         raise RuntimeError("No slices found.")
     healthy_files = [hf[:n] for hf in healthy_files]
     cancer_files = cancer_files[:n]
+    original_n = n
+
+    selected = evenly_spaced_indices(n, max_slices)
+    if len(selected) < n:
+        healthy_files = [[hf[i] for i in selected] for hf in healthy_files]
+        cancer_files = [cancer_files[i] for i in selected]
+        n = len(selected)
 
     y_mm, x_mm = get_pixel_spacing_mm(cancer_files[0])
     px_radius = max(1, int(round(2.5 / ((y_mm + x_mm) / 2.0))))
@@ -548,6 +566,8 @@ def run_before(
     pd.DataFrame({"slice_index": np.arange(n), "detected_pixels_gray_only": counts}).to_csv(csv_path, index=False)
 
     summary = {
+        "original_slice_count": original_n,
+        "processed_slice_count": n,
         "initial_total_cancer_pixels": init,
         "treated_total_pixels": treated,
         "remaining_total_pixels": rem,
@@ -665,6 +685,8 @@ def load_or_train_after_model(
     ae_hw: Tuple[int, int],
     model_path: str,
     force_retrain: bool = False,
+    max_train_samples: int = 600,
+    train_epochs: int = 4,
 ):
     tf = get_tf()
     if not healthy_ae:
@@ -675,15 +697,15 @@ def load_or_train_after_model(
         return load_model_cached(abs_path), False
 
     x_train = np.stack(healthy_ae, axis=0).astype(np.float32)
-    if x_train.shape[0] > 1200:
-        idx = np.random.choice(x_train.shape[0], 1200, replace=False)
+    if x_train.shape[0] > max_train_samples:
+        idx = np.random.choice(x_train.shape[0], max_train_samples, replace=False)
         x_train = x_train[idx]
     x_train = x_train[..., None]
 
     tf.keras.backend.clear_session()
     ae = build_ae((ae_hw[0], ae_hw[1], 1), 1e-3)
     es = tf.keras.callbacks.EarlyStopping(monitor="loss", patience=2, restore_best_weights=True)
-    ae.fit(x_train, x_train, epochs=8, batch_size=8, shuffle=True, verbose=0, callbacks=[es])
+    ae.fit(x_train, x_train, epochs=train_epochs, batch_size=8, shuffle=True, verbose=0, callbacks=[es])
 
     if abs_path:
         Path(abs_path).parent.mkdir(parents=True, exist_ok=True)
@@ -704,6 +726,9 @@ def run_after(
     fps: int,
     frame_stride: int,
     max_gif_frames: int,
+    max_slices: int,
+    ae_train_epochs: int,
+    ae_max_train_samples: int,
 ) -> Dict[str, object]:
     os.makedirs(out_dir, exist_ok=True)
     t0 = time.time()
@@ -715,6 +740,13 @@ def run_after(
         raise RuntimeError("No slices found.")
     healthy_files = [hf[:n] for hf in healthy_files]
     cancer_files = cancer_files[:n]
+    original_n = n
+
+    selected = evenly_spaced_indices(n, max_slices)
+    if len(selected) < n:
+        healthy_files = [[hf[i] for i in selected] for hf in healthy_files]
+        cancer_files = [cancer_files[i] for i in selected]
+        n = len(selected)
 
     gray_masks, lung_masks, valid_masks, diff_scores = [], [], [], []
     ct_slices_u8, healthy_ae, cancer_ae = [], [], []
@@ -768,6 +800,8 @@ def run_after(
         ae_hw=ae_hw,
         model_path=model_path,
         force_retrain=force_retrain_model,
+        max_train_samples=ae_max_train_samples,
+        train_epochs=ae_train_epochs,
     )
     x_cancer = np.stack(cancer_ae, axis=0).astype(np.float32)[..., None]
     pred = model.predict(x_cancer, batch_size=8, verbose=0)
@@ -843,6 +877,8 @@ def run_after(
     pd.DataFrame({"slice_index": np.arange(n), "detected_pixels_gray_lung_ai": counts}).to_csv(csv_path, index=False)
 
     summary = {
+        "original_slice_count": original_n,
+        "processed_slice_count": n,
         "initial_total_cancer_pixels": init,
         "treated_total_pixels": treated,
         "remaining_total_pixels": rem,
@@ -902,10 +938,31 @@ def main() -> None:
         force_retrain = st.checkbox("Force retrain AFTER model", value=False)
 
         st.subheader("GIF")
-        make_gif = st.checkbox("Generate GIFs", value=True)
+        make_gif = st.checkbox("Generate GIFs", value=False)
         fps = st.number_input("FPS", min_value=1, max_value=30, value=12)
         frame_stride = st.number_input("Frame stride", min_value=1, max_value=30, value=6)
         max_gif_frames = st.number_input("Max GIF frames", min_value=50, max_value=5000, value=900)
+
+        st.subheader("Performance")
+        max_slices = st.number_input(
+            "Max slices to process per run",
+            min_value=20,
+            max_value=1200,
+            value=120,
+            help="Lower this if the app crashes due to memory limits.",
+        )
+        ae_train_epochs = st.number_input(
+            "AFTER model train epochs (used only when retraining)",
+            min_value=1,
+            max_value=12,
+            value=4,
+        )
+        ae_max_train_samples = st.number_input(
+            "AFTER max training samples",
+            min_value=100,
+            max_value=2000,
+            value=600,
+        )
 
         run_btn = st.button("Run Comparison", type="primary", use_container_width=True)
 
@@ -1057,6 +1114,7 @@ def main() -> None:
                     fps=int(fps),
                     frame_stride=int(frame_stride),
                     max_gif_frames=int(max_gif_frames),
+                    max_slices=int(max_slices),
                 )
 
                 st.write("Running AFTER...")
@@ -1070,6 +1128,9 @@ def main() -> None:
                     fps=int(fps),
                     frame_stride=int(frame_stride),
                     max_gif_frames=int(max_gif_frames),
+                    max_slices=int(max_slices),
+                    ae_train_epochs=int(ae_train_epochs),
+                    ae_max_train_samples=int(ae_max_train_samples),
                 )
 
                 status.update(label="Completed", state="complete")
@@ -1087,6 +1148,15 @@ def main() -> None:
             "healthy_input_mode": healthy_input_mode,
             "before_healthy_paths": before_paths,
             "after_healthy_paths": after_paths,
+            "run_settings": {
+                "make_gif": bool(make_gif),
+                "fps": int(fps),
+                "frame_stride": int(frame_stride),
+                "max_gif_frames": int(max_gif_frames),
+                "max_slices": int(max_slices),
+                "ae_train_epochs": int(ae_train_epochs),
+                "ae_max_train_samples": int(ae_max_train_samples),
+            },
             "before": before,
             "after": after,
             "comparison_metrics": cmp_df.reset_index().to_dict(orient="records"),

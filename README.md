@@ -42,7 +42,11 @@ streamlit run app.py
 3. If using upload mode, upload healthy trials for `trial1`, `trial2`, `trial3` in the Run tab.
 4. Keep cached model path as `model_cache/after_ae_model.keras`.
 5. Leave `Force retrain AFTER model` unchecked for reuse.
-6. Click **Run Comparison**.
+6. For Streamlit Cloud stability, keep:
+   - `Generate GIFs` off unless needed
+   - `Max slices to process per run` around `80-150`
+   - lower `AFTER model train epochs` if retraining
+7. Click **Run Comparison**.
 
 First run:
 - trains and saves `model_cache/after_ae_model.keras`.
