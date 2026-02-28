@@ -9,20 +9,25 @@ import shutil
 import time
 import zipfile
 from datetime import datetime
-from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
-import pandas as pd
 import pydicom
 import streamlit as st
-from matplotlib import animation, pyplot as plt
+from PIL import Image, ImageDraw
 from scipy import ndimage
 
 
-# -----------------------------------------------------------------------------
-# Shared utilities
-# -----------------------------------------------------------------------------
+DEFAULT_MODEL_PATH = "model_cache/after_ae_model.keras"
+DEFAULT_OUTPUT_ROOT = "outputs"
+
+
+def get_tf():
+    try:
+        import tensorflow as tf
+    except Exception as e:
+        raise RuntimeError("TensorFlow is required to load and run the model.") from e
+    return tf
 
 
 def seed_everything(seed: int = 42) -> None:
@@ -32,18 +37,43 @@ def seed_everything(seed: int = 42) -> None:
         tf = get_tf()
         tf.random.set_seed(seed)
     except Exception:
-        # BEFORE flow can run without TensorFlow.
+        # App can still render until model inference is requested.
         pass
 
 
-def get_tf():
-    try:
-        import tensorflow as tf
-    except Exception as e:
-        raise RuntimeError(
-            "TensorFlow could not be imported. Ensure `tensorflow` is installed in the deployment environment."
-        ) from e
-    return tf
+def save_uploaded_files(uploaded_files: List[st.runtime.uploaded_file_manager.UploadedFile], dest_root: str) -> str:
+    if os.path.isdir(dest_root):
+        shutil.rmtree(dest_root)
+    os.makedirs(dest_root, exist_ok=True)
+
+    if not uploaded_files:
+        raise RuntimeError("No uploaded files received.")
+
+    for i, uf in enumerate(uploaded_files):
+        name = os.path.basename(uf.name)
+        raw = uf.getvalue()
+
+        if name.lower().endswith(".zip"):
+            with zipfile.ZipFile(io.BytesIO(raw), "r") as zf:
+                zf.extractall(dest_root)
+        else:
+            out_name = f"{i:04d}_{name}"
+            out_path = os.path.join(dest_root, out_name)
+            with open(out_path, "wb") as f:
+                f.write(raw)
+
+    best_dir = None
+    best_count = -1
+    for root, _, files in os.walk(dest_root):
+        count = sum(1 for fn in files if os.path.isfile(os.path.join(root, fn)))
+        if count > best_count:
+            best_count = count
+            best_dir = root
+
+    if best_dir is None or best_count <= 0:
+        raise RuntimeError("No readable files were found after upload extraction.")
+
+    return best_dir
 
 
 def get_sorted_dicom_files(folder: str) -> List[str]:
@@ -120,6 +150,29 @@ def lung_mask_2d(ct_hu: np.ndarray) -> np.ndarray:
     return m.astype(bool)
 
 
+def robust_positive_z(arr: np.ndarray, valid: np.ndarray) -> np.ndarray:
+    vals = arr[valid] if np.any(valid) else arr.ravel()
+    med = np.median(vals)
+    mad = np.median(np.abs(vals - med)) + 1e-6
+    z = 0.6745 * (arr - med) / mad
+    return np.clip(z, 0.0, None).astype(np.float32)
+
+
+def evenly_spaced_indices(total: int, limit: int) -> List[int]:
+    if limit <= 0 or total <= limit:
+        return list(range(total))
+    idx = np.linspace(0, total - 1, num=limit)
+    idx = np.round(idx).astype(int)
+    idx = np.clip(idx, 0, total - 1)
+    return list(dict.fromkeys(idx.tolist()))
+
+
+def breathing_order(n: int) -> List[int]:
+    if n <= 1:
+        return [0]
+    return list(range(n)) + list(range(n - 2, -1, -1))
+
+
 def disk_mask(shape: Tuple[int, int], cy: int, cx: int, radius: int) -> np.ndarray:
     yy, xx = np.ogrid[: shape[0], : shape[1]]
     return (yy - cy) ** 2 + (xx - cx) ** 2 <= (radius ** 2)
@@ -155,477 +208,6 @@ def nearest_active(mask: np.ndarray, yx: Tuple[int, int]) -> Optional[Tuple[int,
     return int(coords[j, 0]), int(coords[j, 1])
 
 
-def breathing_order(n: int) -> List[int]:
-    if n <= 1:
-        return [0]
-    return list(range(n)) + list(range(n - 2, -1, -1))
-
-
-def as_py(v):
-    if isinstance(v, (np.integer,)):
-        return int(v)
-    if isinstance(v, (np.floating,)):
-        return float(v)
-    if isinstance(v, (np.bool_,)):
-        return bool(v)
-    if isinstance(v, np.ndarray):
-        return v.tolist()
-    return v
-
-
-def save_uploaded_files(uploaded_files: List[st.runtime.uploaded_file_manager.UploadedFile], dest_root: str) -> str:
-    if os.path.isdir(dest_root):
-        shutil.rmtree(dest_root)
-    os.makedirs(dest_root, exist_ok=True)
-
-    if not uploaded_files:
-        raise RuntimeError("No uploaded files received.")
-
-    for i, uf in enumerate(uploaded_files):
-        name = os.path.basename(uf.name)
-        raw = uf.getvalue()
-
-        if name.lower().endswith(".zip"):
-            with zipfile.ZipFile(io.BytesIO(raw), "r") as zf:
-                zf.extractall(dest_root)
-        else:
-            # Prefix index to avoid accidental filename collisions.
-            out_name = f"{i:04d}_{name}"
-            out_path = os.path.join(dest_root, out_name)
-            with open(out_path, "wb") as f:
-                f.write(raw)
-
-    # Pick the deepest folder with the most files.
-    best_dir = None
-    best_count = -1
-    for root, _, files in os.walk(dest_root):
-        count = sum(1 for fn in files if os.path.isfile(os.path.join(root, fn)))
-        if count > best_count:
-            best_count = count
-            best_dir = root
-
-    if best_dir is None or best_count <= 0:
-        raise RuntimeError("No readable files were found after upload extraction.")
-
-    return best_dir
-
-
-def save_uploaded_cancer_files(uploaded_files: List[st.runtime.uploaded_file_manager.UploadedFile], dest_root: str) -> str:
-    return save_uploaded_files(uploaded_files, dest_root)
-
-
-def parse_paths(text: str) -> List[str]:
-    return [line.strip() for line in text.splitlines() if line.strip()]
-
-
-def evenly_spaced_indices(total: int, limit: int) -> List[int]:
-    if limit <= 0 or total <= limit:
-        return list(range(total))
-    idx = np.linspace(0, total - 1, num=limit)
-    idx = np.round(idx).astype(int)
-    idx = np.clip(idx, 0, total - 1)
-    # Preserve order but remove duplicates from rounding.
-    return list(dict.fromkeys(idx.tolist()))
-
-
-def validate_healthy_paths(paths: List[str], label: str) -> None:
-    if not paths:
-        raise ValueError(f"{label} requires at least one healthy folder path.")
-    for p in paths:
-        if not os.path.isdir(p):
-            raise FileNotFoundError(f"{label} path missing: {p}")
-        _ = get_sorted_dicom_files(p)
-
-
-def parse_saved_payload(uploaded_json) -> Dict[str, object]:
-    raw = uploaded_json.getvalue().decode("utf-8")
-    payload = json.loads(raw)
-    if not isinstance(payload, dict):
-        raise ValueError("model_output.json must contain a JSON object.")
-    if "after" not in payload or not isinstance(payload["after"], dict):
-        raise ValueError("model_output.json must include an `after` section as a JSON object.")
-    if "before" in payload and payload["before"] is not None and not isinstance(payload["before"], dict):
-        raise ValueError("`before` must be a JSON object when provided.")
-    return payload
-
-
-def build_comparison_df(before: Optional[Dict[str, object]], after: Dict[str, object]) -> pd.DataFrame:
-    before = before or {}
-    metrics = [
-        "initial_total_cancer_pixels",
-        "treated_total_pixels",
-        "remaining_total_pixels",
-        "percent_removed",
-        "laser_steps",
-        "stopped_when_all_cancer_gone",
-        "runtime_seconds",
-    ]
-    return pd.DataFrame(
-        {
-            "metric": metrics,
-            "before": [before.get(m, "N/A") for m in metrics],
-            "after": [after.get(m, "N/A") for m in metrics],
-        }
-    ).set_index("metric")
-
-
-def render_comparison_outputs(before: Optional[Dict[str, object]], after: Dict[str, object]) -> pd.DataFrame:
-    before = before or {}
-    cmp_df = build_comparison_df(before, after)
-
-    st.subheader("Metrics")
-    st.dataframe(cmp_df, use_container_width=True)
-
-    model_path = str(after.get("model_path", "") or "")
-    if after.get("model_retrained"):
-        st.warning(f"AFTER model retrained and saved to `{model_path}`")
-    elif model_path:
-        st.success(f"AFTER model loaded from cache: `{model_path}`")
-
-    if model_path and os.path.exists(model_path):
-        with open(model_path, "rb") as f:
-            model_blob = f.read()
-        st.download_button(
-            "Download AFTER model (.keras)",
-            data=model_blob,
-            file_name=Path(model_path).name,
-            mime="application/octet-stream",
-        )
-
-        repo_path = os.path.relpath(model_path, os.getcwd())
-        with st.expander("Save model to GitHub"):
-            st.code(
-                "\n".join(
-                    [
-                        "git lfs install",
-                        "git add .gitattributes",
-                        f"git add {repo_path}",
-                        'git commit -m "Add cached AFTER model"',
-                        "git push",
-                    ]
-                ),
-                language="bash",
-            )
-
-    col1, col2 = st.columns(2)
-    with col1:
-        st.markdown("### Before")
-        before_gif = str(before.get("gif_path", "") or "")
-        if before_gif and os.path.exists(before_gif):
-            st.image(before_gif, use_container_width=True)
-        else:
-            st.info("Before GIF not available (pipeline may have been skipped).")
-        st.caption(f"GIF: `{before_gif}`")
-
-    with col2:
-        st.markdown("### After")
-        after_gif = str(after.get("gif_path", "") or "")
-        if after_gif and os.path.exists(after_gif):
-            st.image(after_gif, use_container_width=True)
-        else:
-            st.info("After GIF not found at saved path.")
-        st.caption(f"GIF: `{after_gif}`")
-
-    return cmp_df
-
-
-# -----------------------------------------------------------------------------
-# Treatment + GIF renderer
-# -----------------------------------------------------------------------------
-
-
-def run_treatment(
-    active_global: np.ndarray,
-    px_radius: int,
-    max_steps: int = 160000,
-    make_gif: bool = False,
-    gif_path: Optional[str] = None,
-    ct_slices_u8: Optional[List[np.ndarray]] = None,
-    gray_masks: Optional[List[np.ndarray]] = None,
-    fps: int = 12,
-    frame_stride: int = 6,
-    max_gif_frames: int = 900,
-    laser_off_when_idle: bool = False,
-) -> Tuple[int, int, int, float, int]:
-    steps = 0
-    treated = 0
-    initial = int(active_global.sum())
-
-    writer = fig = ax = im = dot = None
-    captured = 0
-    capture_step = 0
-    breath_seq = [0]
-
-    if (
-        make_gif
-        and gif_path
-        and ct_slices_u8 is not None
-        and gray_masks is not None
-        and len(ct_slices_u8) == len(gray_masks)
-        and len(ct_slices_u8) > 0
-    ):
-        breath_seq = breathing_order(len(ct_slices_u8))
-        fig, ax = plt.subplots(figsize=(6, 6))
-        ax.axis("off")
-
-        first_bg = breath_seq[0]
-        bg = ct_slices_u8[first_bg].astype(np.float32) / 255.0
-        frame = np.repeat(bg[..., None], 3, axis=2)
-        visible = active_global & gray_masks[first_bg]
-        frame[visible, 0] = 1.0
-        frame[visible, 1] = 1.0
-        frame[visible, 2] = 0.0
-
-        im = ax.imshow(frame, interpolation="nearest")
-        dot = plt.Circle((0, 0), radius=px_radius, edgecolor="red", fill=False, linewidth=2)
-        dot.set_visible(False)
-        ax.add_patch(dot)
-
-        writer = animation.PillowWriter(fps=fps)
-        writer.setup(fig, gif_path, dpi=90)
-        writer.grab_frame()
-        captured = 1
-
-        def draw_frame(bg_idx: int, show_dot: bool = False, pos: Tuple[int, int] = (0, 0), color: str = "red") -> None:
-            bg0 = ct_slices_u8[bg_idx].astype(np.float32) / 255.0
-            rgb = np.repeat(bg0[..., None], 3, axis=2)
-            visible_overlay = active_global & gray_masks[bg_idx]
-            rgb[visible_overlay, 0] = 1.0
-            rgb[visible_overlay, 1] = 1.0
-            rgb[visible_overlay, 2] = 0.0
-            im.set_data(rgb)
-
-            if show_dot:
-                py, px = pos
-                dot.center = (px, py)
-                dot.set_edgecolor(color)
-                dot.set_visible(True)
-            else:
-                dot.set_visible(False)
-
-    if initial > 0:
-        coords = np.argwhere(active_global)
-        y, x = np.mean(coords, axis=0).astype(int)
-    else:
-        y, x = active_global.shape[0] // 2, active_global.shape[1] // 2
-
-    while active_global.any() and steps < max_steps:
-        target = nearest_active(active_global, (y, x))
-        if target is None:
-            break
-        ty, tx = target
-
-        for py, px in bresenham_line(y, x, ty, tx):
-            steps += 1
-            hit = active_global & disk_mask(active_global.shape, py, px, px_radius)
-            laser_on = np.any(hit)
-
-            if laser_on:
-                n = int(hit.sum())
-                active_global[hit] = False
-                treated += n
-
-            if writer is not None and (steps % frame_stride == 0) and (captured < max_gif_frames):
-                bg_idx = breath_seq[capture_step % len(breath_seq)]
-                if laser_off_when_idle and not laser_on:
-                    draw_frame(bg_idx, show_dot=False)
-                else:
-                    draw_frame(bg_idx, show_dot=True, pos=(py, px), color=("red" if laser_on else "blue"))
-                writer.grab_frame()
-                captured += 1
-                capture_step += 1
-
-            if not active_global.any() or steps >= max_steps:
-                break
-
-        y, x = ty, tx
-
-    if writer is not None:
-        if captured < max_gif_frames:
-            bg_idx = breath_seq[capture_step % len(breath_seq)]
-            draw_frame(
-                bg_idx,
-                show_dot=False if laser_off_when_idle else True,
-                pos=(y, x),
-                color="red",
-            )
-            writer.grab_frame()
-        writer.finish()
-        plt.close(fig)
-
-    remaining = int(active_global.sum())
-    removed_pct = (100.0 * treated / initial) if initial > 0 else 0.0
-    return initial, treated, remaining, removed_pct, steps
-
-
-# -----------------------------------------------------------------------------
-# BEFORE pipeline
-# -----------------------------------------------------------------------------
-
-
-def detect_lesion_before(
-    c_hu: np.ndarray,
-    healthy_hus: List[np.ndarray],
-    zthr: float = 2.5,
-    gray_min: float = 0.10,
-    gray_max: float = 0.85,
-    min_px: int = 40,
-) -> np.ndarray:
-    c_n = ct_window_norm(c_hu)
-    h_n = [ct_window_norm(h) for h in healthy_hus]
-    baseline = np.median(np.stack(h_n, axis=0), axis=0)
-    diff = c_n - baseline
-    med = np.median(diff)
-    mad = np.median(np.abs(diff - med)) + 1e-6
-    z = 0.6745 * (diff - med) / mad
-
-    lesion = (z > zthr) & lung_mask_2d(c_hu) & (c_n >= gray_min) & (c_n <= gray_max)
-    lesion = ndimage.binary_opening(lesion, structure=np.ones((3, 3)))
-    lesion = ndimage.binary_closing(lesion, structure=np.ones((5, 5)))
-    lesion = remove_small_blobs(lesion, min_px)
-    return lesion.astype(bool)
-
-
-def run_before(
-    cancer_path: str,
-    healthy_paths: List[str],
-    out_dir: str,
-    make_gif: bool,
-    fps: int,
-    frame_stride: int,
-    max_gif_frames: int,
-    max_slices: int,
-) -> Dict[str, object]:
-    os.makedirs(out_dir, exist_ok=True)
-    t0 = time.time()
-
-    healthy_files = [get_sorted_dicom_files(p) for p in healthy_paths]
-    cancer_files = get_sorted_dicom_files(cancer_path)
-    n = min([len(cancer_files)] + [len(hf) for hf in healthy_files])
-    if n == 0:
-        raise RuntimeError("No slices found.")
-    healthy_files = [hf[:n] for hf in healthy_files]
-    cancer_files = cancer_files[:n]
-    original_n = n
-
-    selected = evenly_spaced_indices(n, max_slices)
-    if len(selected) < n:
-        healthy_files = [[hf[i] for i in selected] for hf in healthy_files]
-        cancer_files = [cancer_files[i] for i in selected]
-        n = len(selected)
-
-    y_mm, x_mm = get_pixel_spacing_mm(cancer_files[0])
-    px_radius = max(1, int(round(2.5 / ((y_mm + x_mm) / 2.0))))
-
-    lesions, grays, ct_slices_u8 = [], [], []
-    counts = np.zeros(n, dtype=np.int32)
-    ref_shape = None
-
-    for i in range(n):
-        c = read_hu(cancer_files[i])
-        if ref_shape is None:
-            ref_shape = c.shape
-        c = resize_2d(c, ref_shape, order=1)
-        c_n = ct_window_norm(c)
-
-        healthy_hus = [resize_2d(read_hu(hf[i]), ref_shape, order=1) for hf in healthy_files]
-        lesion = detect_lesion_before(c, healthy_hus)
-        gray = (c_n >= 0.10) & (c_n <= 0.85)
-        lesion = lesion & gray
-
-        lesions.append(lesion)
-        grays.append(gray)
-        ct_slices_u8.append((c_n * 255.0).astype(np.uint8))
-        counts[i] = int(lesion.sum())
-
-        if (i + 1) % 25 == 0:
-            gc.collect()
-
-    active = np.zeros(ref_shape, dtype=bool)
-    gray_union = np.zeros(ref_shape, dtype=bool)
-    for lesion, gray in zip(lesions, grays):
-        active |= lesion
-        gray_union |= gray
-    active &= gray_union
-    active = remove_small_blobs(active, 40)
-
-    gif_path = os.path.join(out_dir, "before_treatment.gif")
-    init, treated, rem, pct, steps = run_treatment(
-        active,
-        px_radius,
-        max_steps=160000,
-        make_gif=make_gif,
-        gif_path=gif_path,
-        ct_slices_u8=ct_slices_u8,
-        gray_masks=grays,
-        fps=fps,
-        frame_stride=frame_stride,
-        max_gif_frames=max_gif_frames,
-        laser_off_when_idle=False,
-    )
-
-    csv_path = os.path.join(out_dir, "slice_detected_counts.csv")
-    pd.DataFrame({"slice_index": np.arange(n), "detected_pixels_gray_only": counts}).to_csv(csv_path, index=False)
-
-    summary = {
-        "original_slice_count": original_n,
-        "processed_slice_count": n,
-        "initial_total_cancer_pixels": init,
-        "treated_total_pixels": treated,
-        "remaining_total_pixels": rem,
-        "percent_removed": round(float(pct), 2),
-        "laser_steps": steps,
-        "stopped_when_all_cancer_gone": bool(rem == 0),
-        "runtime_seconds": round(float(time.time() - t0), 2),
-        "csv_path": csv_path,
-        "output_dir": out_dir,
-        "gif_path": gif_path,
-    }
-    return {k: as_py(v) for k, v in summary.items()}
-
-
-# -----------------------------------------------------------------------------
-# AFTER pipeline (with model caching)
-# -----------------------------------------------------------------------------
-
-
-def remove_small_components_3d(mask3d: np.ndarray, min_vox: int = 40, min_span: int = 1) -> np.ndarray:
-    lab, n = ndimage.label(mask3d)
-    if n == 0:
-        return np.zeros_like(mask3d, dtype=bool)
-    keep_ids = []
-    for cid in range(1, n + 1):
-        pts = np.argwhere(lab == cid)
-        if pts.shape[0] < min_vox:
-            continue
-        zspan = int(pts[:, 0].max() - pts[:, 0].min() + 1)
-        if zspan < min_span:
-            continue
-        keep_ids.append(cid)
-    if not keep_ids:
-        return np.zeros_like(mask3d, dtype=bool)
-    return np.isin(lab, keep_ids)
-
-
-def temporal_majority_3d(mask3d: np.ndarray, min_support: int = 2) -> np.ndarray:
-    m = mask3d.astype(np.uint8)
-    acc = m.copy()
-    acc[1:] += m[:-1]
-    acc[:-1] += m[1:]
-    out = acc >= min_support
-    if out.sum() == 0 and mask3d.sum() > 0:
-        return mask3d
-    return out
-
-
-def robust_positive_z(arr: np.ndarray, valid: np.ndarray) -> np.ndarray:
-    vals = arr[valid] if np.any(valid) else arr.ravel()
-    med = np.median(vals)
-    mad = np.median(np.abs(vals - med)) + 1e-6
-    z = 0.6745 * (arr - med) / mad
-    return np.clip(z, 0.0, None).astype(np.float32)
-
-
 def build_ae(shape: Tuple[int, int, int] = (160, 160, 1), lr: float = 1e-3):
     tf = get_tf()
     i = tf.keras.layers.Input(shape=shape)
@@ -640,501 +222,415 @@ def build_ae(shape: Tuple[int, int, int] = (160, 160, 1), lr: float = 1e-3):
     return m
 
 
-def neurosymbolic_cleanup(mask3d: np.ndarray, min_px: int = 18, min_vox: int = 40, min_span: int = 1) -> np.ndarray:
-    out = np.zeros_like(mask3d, dtype=bool)
-    for z in range(mask3d.shape[0]):
-        m = ndimage.binary_opening(mask3d[z], structure=np.ones((3, 3)))
-        m = ndimage.binary_closing(m, structure=np.ones((5, 5)))
-        out[z] = remove_small_blobs(m, min_px)
-    out = temporal_majority_3d(out, min_support=2)
-    out3 = remove_small_components_3d(out, min_vox=min_vox, min_span=min_span)
-    return out3 if out3.sum() > 0 else out
-
-
-def topk_fallback_3d(score3d: np.ndarray, valid3d: np.ndarray, ratio: float = 0.006, min_per_slice: int = 14) -> np.ndarray:
-    out = np.zeros_like(valid3d, dtype=bool)
-    for z in range(score3d.shape[0]):
-        valid_idx = np.flatnonzero(valid3d[z].ravel())
-        if valid_idx.size == 0:
-            continue
-        k = max(min_per_slice, int(valid_idx.size * ratio))
-        if k >= valid_idx.size:
-            chosen = valid_idx
-        else:
-            vals = score3d[z].ravel()[valid_idx]
-            chosen = valid_idx[np.argpartition(vals, -k)[-k:]]
-        out[z].ravel()[chosen] = True
-    return out
-
-
-def max_lung_width_px(mask3d: np.ndarray) -> int:
-    widths = []
-    for z in range(mask3d.shape[0]):
-        _, xs = np.where(mask3d[z])
-        if xs.size:
-            widths.append(int(xs.max() - xs.min() + 1))
-    return max(widths) if widths else 1
-
-
 @st.cache_resource(show_spinner=False)
 def load_model_cached(path: str):
     tf = get_tf()
     try:
         return tf.keras.models.load_model(path, compile=False)
     except Exception as load_err:
-        # Cross-environment fallback: rebuild known architecture and load only weights.
         try:
             model = build_ae((160, 160, 1), 1e-3)
             model.load_weights(path)
             return model
         except Exception as weights_err:
             raise RuntimeError(
-                "Failed to load cached model. This is usually a TensorFlow/Keras version mismatch "
-                f"for `{path}`. Original error: {load_err}"
+                f"Failed to load model from `{path}`. Original load error: {load_err}"
             ) from weights_err
 
 
-def load_or_train_after_model(
-    healthy_ae: List[np.ndarray],
-    ae_hw: Tuple[int, int],
-    model_path: str,
-    force_retrain: bool = False,
-    max_train_samples: int = 600,
-    train_epochs: int = 4,
-    allow_training: bool = True,
-):
-    tf = get_tf()
-    abs_path = os.path.abspath(model_path) if model_path else ""
-    if abs_path and os.path.exists(abs_path) and not force_retrain:
-        return load_model_cached(abs_path), False
+def prepare_cancer_case(cancer_dir: str, max_slices: int) -> Dict[str, object]:
+    dicom_files = get_sorted_dicom_files(cancer_dir)
+    if not dicom_files:
+        raise RuntimeError("No DICOM files found in upload.")
 
-    if not allow_training:
-        raise FileNotFoundError(
-            f"Cached AFTER model not found at `{abs_path}`. Provide a valid model path or enable retraining."
-        )
+    selected = evenly_spaced_indices(len(dicom_files), max_slices)
+    dicom_files = [dicom_files[i] for i in selected]
 
-    if not healthy_ae:
-        raise RuntimeError("No healthy slices available to train AFTER model.")
+    hu_slices: List[np.ndarray] = []
+    norm_slices: List[np.ndarray] = []
+    u8_slices: List[np.ndarray] = []
+    gray_masks: List[np.ndarray] = []
+    valid_masks: List[np.ndarray] = []
 
-    x_train = np.stack(healthy_ae, axis=0).astype(np.float32)
-    if x_train.shape[0] > max_train_samples:
-        idx = np.random.choice(x_train.shape[0], max_train_samples, replace=False)
-        x_train = x_train[idx]
-    x_train = x_train[..., None]
-
-    tf.keras.backend.clear_session()
-    ae = build_ae((ae_hw[0], ae_hw[1], 1), 1e-3)
-    es = tf.keras.callbacks.EarlyStopping(monitor="loss", patience=2, restore_best_weights=True)
-    ae.fit(x_train, x_train, epochs=train_epochs, batch_size=8, shuffle=True, verbose=0, callbacks=[es])
-
-    if abs_path:
-        Path(abs_path).parent.mkdir(parents=True, exist_ok=True)
-        ae.save(abs_path)
-        load_model_cached.clear()
-        return load_model_cached(abs_path), True
-
-    return ae, True
-
-
-def run_after(
-    cancer_path: str,
-    healthy_paths: List[str],
-    out_dir: str,
-    model_path: str,
-    force_retrain_model: bool,
-    allow_after_training: bool,
-    make_gif: bool,
-    fps: int,
-    frame_stride: int,
-    max_gif_frames: int,
-    max_slices: int,
-    ae_train_epochs: int,
-    ae_max_train_samples: int,
-) -> Dict[str, object]:
-    os.makedirs(out_dir, exist_ok=True)
-    t0 = time.time()
-
-    use_healthy_reference = len(healthy_paths) > 0
-    healthy_files = [get_sorted_dicom_files(p) for p in healthy_paths] if use_healthy_reference else []
-    cancer_files = get_sorted_dicom_files(cancer_path)
-    n = min([len(cancer_files)] + [len(hf) for hf in healthy_files]) if use_healthy_reference else len(cancer_files)
-    if n == 0:
-        raise RuntimeError("No slices found.")
-    healthy_files = [hf[:n] for hf in healthy_files] if use_healthy_reference else []
-    cancer_files = cancer_files[:n]
-    original_n = n
-
-    selected = evenly_spaced_indices(n, max_slices)
-    if len(selected) < n:
-        healthy_files = [[hf[i] for i in selected] for hf in healthy_files]
-        cancer_files = [cancer_files[i] for i in selected]
-        n = len(selected)
-
-    gray_masks, lung_masks, valid_masks, diff_scores = [], [], [], []
-    ct_slices_u8, healthy_ae, cancer_ae = [], [], []
-    counts = np.zeros(n, dtype=np.int32)
     ref_shape = None
-    ae_hw = (160, 160)
-
-    for i in range(n):
-        c = read_hu(cancer_files[i])
+    for i, f in enumerate(dicom_files):
+        hu = read_hu(f)
         if ref_shape is None:
-            ref_shape = c.shape
-        c = resize_2d(c, ref_shape, order=1)
-        c_n = ct_window_norm(c)
-        ct_slices_u8.append((c_n * 255.0).astype(np.uint8))
+            ref_shape = hu.shape
+        hu = resize_2d(hu, ref_shape, order=1)
 
-        if use_healthy_reference:
-            healthy_norms = []
-            for hf in healthy_files:
-                h = resize_2d(read_hu(hf[i]), ref_shape, order=1)
-                h_n = ct_window_norm(h)
-                healthy_norms.append(h_n)
-                healthy_ae.append(resize_2d(h_n, ae_hw, order=1))
-            baseline = np.median(np.stack(healthy_norms, axis=0), axis=0)
-            diff = np.abs(c_n - baseline)
-        else:
-            # Model-only mode: anomaly score relies on AE reconstruction error.
-            diff = np.zeros_like(c_n, dtype=np.float32)
+        norm = ct_window_norm(hu)
+        gray = (norm >= 0.10) & (norm <= 0.85)
+        lung = lung_mask_2d(hu)
+        valid = lung & gray
+        if valid.sum() < 50:
+            valid = lung
+        if valid.sum() < 50:
+            valid = gray
+        if valid.sum() < 50:
+            valid = np.ones_like(gray, dtype=bool)
 
-        lmask = lung_mask_2d(c)
-        gmask = (c_n >= 0.10) & (c_n <= 0.85)
-        valid = lmask & gmask
-        if valid.sum() < 50:
-            valid = lmask
-        if valid.sum() < 50:
-            valid = gmask
-        if valid.sum() < 50:
-            valid = np.ones_like(gmask, dtype=bool)
-
-        gray_masks.append(gmask)
-        lung_masks.append(lmask)
+        hu_slices.append(hu)
+        norm_slices.append(norm)
+        u8_slices.append((norm * 255.0).astype(np.uint8))
+        gray_masks.append(gray)
         valid_masks.append(valid)
-        diff_scores.append(diff)
-        cancer_ae.append(resize_2d(c_n, ae_hw, order=1))
 
         if (i + 1) % 25 == 0:
             gc.collect()
 
-    diff_3d = np.stack(diff_scores, axis=0).astype(np.float32)
-    valid_3d = np.stack(valid_masks, axis=0).astype(bool)
-    ae_err = np.zeros_like(diff_3d, dtype=np.float32)
+    return {
+        "dicom_files": dicom_files,
+        "hu_slices": hu_slices,
+        "norm_slices": norm_slices,
+        "u8_slices": u8_slices,
+        "gray_masks": gray_masks,
+        "valid_masks": valid_masks,
+    }
 
-    model, trained_now = load_or_train_after_model(
-        healthy_ae=healthy_ae,
-        ae_hw=ae_hw,
-        model_path=model_path,
-        force_retrain=force_retrain_model,
-        max_train_samples=ae_max_train_samples,
-        train_epochs=ae_train_epochs,
-        allow_training=allow_after_training,
+
+def detect_lesions_with_model(
+    model,
+    norm_slices: List[np.ndarray],
+    valid_masks: List[np.ndarray],
+    min_pixels: int = 18,
+) -> List[np.ndarray]:
+    if not norm_slices:
+        return []
+
+    input_shape = model.input_shape
+    if isinstance(input_shape, list):
+        input_shape = input_shape[0]
+
+    ae_h = int(input_shape[1]) if input_shape[1] else 160
+    ae_w = int(input_shape[2]) if input_shape[2] else 160
+    ae_hw = (ae_h, ae_w)
+
+    x = np.stack([resize_2d(s, ae_hw, order=1) for s in norm_slices], axis=0).astype(np.float32)[..., None]
+    pred = model.predict(x, batch_size=8, verbose=0)
+    err_small = np.abs(x - pred)[..., 0]
+
+    lesions: List[np.ndarray] = []
+    fallback_scores: List[np.ndarray] = []
+    for i in range(len(norm_slices)):
+        err = resize_2d(err_small[i], norm_slices[i].shape, order=1)
+        z = robust_positive_z(err, valid_masks[i])
+        vals = z[valid_masks[i]] if np.any(valid_masks[i]) else z.ravel()
+
+        hi = float(np.percentile(vals, 98.5))
+        lo = float(np.percentile(vals, 96.5))
+
+        mask = z > hi
+        for _ in range(1):
+            mask |= ndimage.binary_dilation(mask, structure=np.ones((3, 3))) & (z > lo)
+        mask &= valid_masks[i]
+        mask = ndimage.binary_opening(mask, structure=np.ones((3, 3)))
+        mask = ndimage.binary_closing(mask, structure=np.ones((5, 5)))
+        mask = remove_small_blobs(mask, min_pixels=min_pixels).astype(bool)
+
+        lesions.append(mask)
+        fallback_scores.append(z)
+
+    if int(sum(m.sum() for m in lesions)) == 0:
+        lesions = []
+        for i, score in enumerate(fallback_scores):
+            valid = valid_masks[i]
+            out = np.zeros_like(valid, dtype=bool)
+            valid_idx = np.flatnonzero(valid.ravel())
+            if valid_idx.size == 0:
+                lesions.append(out)
+                continue
+            k = max(14, int(valid_idx.size * 0.006))
+            vals = score.ravel()[valid_idx]
+            if k >= valid_idx.size:
+                chosen = valid_idx
+            else:
+                chosen = valid_idx[np.argpartition(vals, -k)[-k:]]
+            out.ravel()[chosen] = True
+            out = remove_small_blobs(out, min_pixels=min_pixels).astype(bool)
+            lesions.append(out)
+
+    return lesions
+
+
+def save_gif(frames: List[Image.Image], out_path: str, fps: int) -> None:
+    if not frames:
+        raise RuntimeError("No frames available to save GIF.")
+    duration_ms = max(20, int(round(1000 / max(1, fps))))
+    frames[0].save(
+        out_path,
+        save_all=True,
+        append_images=frames[1:],
+        optimize=False,
+        duration=duration_ms,
+        loop=0,
     )
-    x_cancer = np.stack(cancer_ae, axis=0).astype(np.float32)[..., None]
-    pred = model.predict(x_cancer, batch_size=8, verbose=0)
-    err_small = np.abs(x_cancer - pred)[..., 0]
-    for z in range(n):
-        ae_err[z] = resize_2d(err_small[z], ref_shape, order=1)
 
-    diff_z = np.zeros_like(diff_3d, dtype=np.float32)
-    ae_z = np.zeros_like(ae_err, dtype=np.float32)
-    for z in range(n):
-        diff_z[z] = robust_positive_z(diff_3d[z], valid_3d[z])
-        ae_z[z] = robust_positive_z(ae_err[z], valid_3d[z])
-    score = (0.85 * diff_z + 0.15 * ae_z) if use_healthy_reference else ae_z
 
-    lesion_3d = None
-    used_pct = None
-    vals = score[valid_3d] if np.any(valid_3d) else score.ravel()
-    for p in [99.2, 98.8, 98.3, 97.8, 97.2, 96.5]:
-        hi = float(np.percentile(vals, p))
-        lo = float(np.percentile(vals, max(90.0, p - 2.5)))
-        seed = (score > hi) & valid_3d
-        cand = seed.copy()
-        for _ in range(2):
-            cand |= ndimage.binary_dilation(cand, structure=np.ones((1, 3, 3))) & (score > lo) & valid_3d
-        cand = neurosymbolic_cleanup(cand, min_px=18, min_vox=40, min_span=1)
-        if int(cand.sum()) >= 40:
-            lesion_3d = cand
-            used_pct = p
-            break
+def make_before_gif(
+    u8_slices: List[np.ndarray],
+    lesions: List[np.ndarray],
+    out_path: str,
+    fps: int,
+    max_frames: int,
+) -> None:
+    order = breathing_order(len(u8_slices))
+    if len(order) > max_frames:
+        selected = evenly_spaced_indices(len(order), max_frames)
+        order = [order[i] for i in selected]
 
-    if lesion_3d is None:
-        lesion_3d = neurosymbolic_cleanup(
-            topk_fallback_3d(score, valid_3d, ratio=0.006, min_per_slice=14),
-            min_px=18,
-            min_vox=40,
-            min_span=1,
-        )
-        used_pct = -1.0
+    frames: List[Image.Image] = []
+    for idx in order:
+        bg = u8_slices[idx]
+        rgb = np.repeat(bg[..., None], 3, axis=2)
+        m = lesions[idx]
+        rgb[m, 0] = 255
+        rgb[m, 1] = 255
+        rgb[m, 2] = 0
+        frames.append(Image.fromarray(rgb))
 
-    lesions = [lesion_3d[z].astype(bool) for z in range(n)]
-    for z in range(n):
-        lesions[z] = ndimage.binary_dilation(lesions[z], structure=np.ones((3, 3))) & valid_masks[z]
-        counts[z] = int(lesions[z].sum())
+    save_gif(frames, out_path, fps=fps)
 
+
+def build_active_map(lesions: List[np.ndarray], gray_masks: List[np.ndarray], min_pixels: int = 18) -> np.ndarray:
+    if not lesions:
+        raise RuntimeError("Lesion masks are empty.")
+
+    ref_shape = lesions[0].shape
     active = np.zeros(ref_shape, dtype=bool)
     gray_union = np.zeros(ref_shape, dtype=bool)
     for lesion, gray in zip(lesions, gray_masks):
         active |= lesion
         gray_union |= gray
     active &= gray_union
-    active = remove_small_blobs(active, 18)
+    return remove_small_blobs(active, min_pixels=min_pixels).astype(bool)
 
-    lung3d = np.stack(lung_masks, axis=0).astype(bool)
-    px_per_mm = max_lung_width_px(lung3d) / 300.0
-    px_radius = max(1, int(round((5.0 / 2.0) * px_per_mm)))
 
-    gif_path = os.path.join(out_dir, "after_treatment.gif")
-    init, treated, rem, pct, steps = run_treatment(
-        active,
-        px_radius,
-        max_steps=160000,
-        make_gif=make_gif,
-        gif_path=gif_path,
-        ct_slices_u8=ct_slices_u8,
-        gray_masks=gray_masks,
-        fps=fps,
-        frame_stride=frame_stride,
-        max_gif_frames=max_gif_frames,
-        laser_off_when_idle=True,
-    )
+def run_treatment_and_make_after_gif(
+    active_global: np.ndarray,
+    u8_slices: List[np.ndarray],
+    gray_masks: List[np.ndarray],
+    out_path: str,
+    px_radius: int,
+    fps: int,
+    frame_stride: int,
+    max_frames: int,
+    max_steps: int = 160000,
+) -> Dict[str, int]:
+    active = active_global.copy()
+    initial = int(active.sum())
+    treated = 0
+    steps = 0
 
-    csv_path = os.path.join(out_dir, "slice_detected_counts.csv")
-    pd.DataFrame({"slice_index": np.arange(n), "detected_pixels_gray_lung_ai": counts}).to_csv(csv_path, index=False)
+    breath_seq = breathing_order(len(u8_slices))
+    capture_step = 0
+    frames: List[Image.Image] = []
 
-    summary = {
-        "original_slice_count": original_n,
-        "processed_slice_count": n,
-        "initial_total_cancer_pixels": init,
-        "treated_total_pixels": treated,
-        "remaining_total_pixels": rem,
-        "percent_removed": round(float(pct), 2),
+    def capture(show_dot: bool = False, pos: Tuple[int, int] = (0, 0), color: Tuple[int, int, int] = (255, 0, 0)):
+        nonlocal capture_step
+        bg_idx = breath_seq[capture_step % len(breath_seq)]
+        bg = u8_slices[bg_idx]
+        rgb = np.repeat(bg[..., None], 3, axis=2)
+        visible = active & gray_masks[bg_idx]
+        rgb[visible, 0] = 255
+        rgb[visible, 1] = 255
+        rgb[visible, 2] = 0
+        img = Image.fromarray(rgb)
+        if show_dot:
+            py, px = pos
+            draw = ImageDraw.Draw(img)
+            r = px_radius
+            draw.ellipse((px - r, py - r, px + r, py + r), outline=color, width=2)
+        frames.append(img)
+        capture_step += 1
+
+    capture(show_dot=False)
+
+    if initial > 0:
+        coords = np.argwhere(active)
+        y, x = np.mean(coords, axis=0).astype(int)
+    else:
+        y, x = active.shape[0] // 2, active.shape[1] // 2
+
+    while active.any() and steps < max_steps and len(frames) < max_frames:
+        target = nearest_active(active, (y, x))
+        if target is None:
+            break
+        ty, tx = target
+
+        for py, px in bresenham_line(y, x, ty, tx):
+            steps += 1
+            hit = active & disk_mask(active.shape, py, px, px_radius)
+            laser_on = bool(np.any(hit))
+
+            if laser_on:
+                n = int(hit.sum())
+                active[hit] = False
+                treated += n
+
+            if (steps % frame_stride == 0) and (len(frames) < max_frames):
+                capture(
+                    show_dot=True,
+                    pos=(py, px),
+                    color=((255, 0, 0) if laser_on else (0, 0, 255)),
+                )
+
+            if not active.any() or steps >= max_steps or len(frames) >= max_frames:
+                break
+
+        y, x = ty, tx
+
+    if len(frames) < max_frames:
+        capture(show_dot=False)
+
+    save_gif(frames, out_path, fps=fps)
+    remaining = int(active.sum())
+    return {
+        "initial_pixels": initial,
+        "treated_pixels": treated,
+        "remaining_pixels": remaining,
         "laser_steps": steps,
-        "stopped_when_all_cancer_gone": bool(rem == 0),
-        "detection_percentile_used": used_pct,
-        "beam_radius_px": px_radius,
-        "runtime_seconds": round(float(time.time() - t0), 2),
-        "csv_path": csv_path,
-        "output_dir": out_dir,
-        "gif_path": gif_path,
-        "model_path": os.path.abspath(model_path) if model_path else "",
-        "model_retrained": bool(trained_now),
-        "used_healthy_reference": bool(use_healthy_reference),
     }
-    return {k: as_py(v) for k, v in summary.items()}
 
 
-# -----------------------------------------------------------------------------
-# Streamlit UI
-# -----------------------------------------------------------------------------
+def read_bytes(path: str) -> bytes:
+    with open(path, "rb") as f:
+        return f.read()
 
 
 def main() -> None:
-    st.set_page_config(page_title="Before vs After DICOM Comparator", layout="wide")
-    st.title("Before vs After DICOM Comparator")
-    st.caption("Upload one cancer case, reuse cached AFTER model, and compare outputs.")
+    st.set_page_config(page_title="Cancer DICOM GIF Generator", layout="wide")
+    st.title("Cancer DICOM Before/After GIF Generator")
+    st.caption("Uses cached model only: `model_cache/after_ae_model.keras`.")
 
     with st.sidebar:
-        st.subheader("Healthy Reference (Optional)")
-        healthy_paths_raw = st.text_area(
-            "Healthy folders (one per line)",
-            value="",
-            height=110,
-            help="Leave blank to run AFTER in model-only mode. Provide paths only if you want BEFORE and/or healthy-diff scoring.",
-        )
-        run_before_pipeline = st.checkbox(
-            "Run BEFORE pipeline (requires healthy folders)",
-            value=False,
-        )
+        st.subheader("Model")
+        model_path = st.text_input("Model path", value=DEFAULT_MODEL_PATH)
 
-        st.subheader("Run Settings")
-        output_root = st.text_input("Output root", value="outputs")
-        model_path = st.text_input("Cached AFTER model path", value="model_cache/after_ae_model.keras")
-        reuse_cached_model_only = st.checkbox("Reuse cached AFTER model only (no retraining)", value=True)
-        force_retrain = st.checkbox(
-            "Force retrain AFTER model",
-            value=False,
-            disabled=reuse_cached_model_only,
-        )
-        if reuse_cached_model_only:
-            force_retrain = False
+        st.subheader("Output")
+        output_root = st.text_input("Output root", value=DEFAULT_OUTPUT_ROOT)
+        fps = st.number_input("GIF FPS", min_value=1, max_value=30, value=12)
+        frame_stride = st.number_input("Treatment frame stride", min_value=1, max_value=30, value=6)
+        max_frames = st.number_input("Max GIF frames", min_value=30, max_value=2000, value=320)
+        max_slices = st.number_input("Max slices to process", min_value=20, max_value=1200, value=140)
 
-        st.subheader("GIF")
-        make_gif = st.checkbox("Generate GIFs", value=False)
-        fps = st.number_input("FPS", min_value=1, max_value=30, value=12)
-        frame_stride = st.number_input("Frame stride", min_value=1, max_value=30, value=6)
-        max_gif_frames = st.number_input("Max GIF frames", min_value=50, max_value=5000, value=900)
+        run_btn = st.button("Generate Before/After GIFs", type="primary", use_container_width=True)
 
-        st.subheader("Performance")
-        max_slices = st.number_input(
-            "Max slices to process per run",
-            min_value=20,
-            max_value=1200,
-            value=120,
-            help="Lower this if the app crashes due to memory limits.",
-        )
-        ae_train_epochs = st.number_input(
-            "AFTER model train epochs (used only when retraining)",
-            min_value=1,
-            max_value=12,
-            value=4,
-        )
-        ae_max_train_samples = st.number_input(
-            "AFTER max training samples",
-            min_value=100,
-            max_value=2000,
-            value=600,
-        )
+    uploads = st.file_uploader(
+        "Upload one cancer case (DICOM files and/or one ZIP)",
+        accept_multiple_files=True,
+    )
 
-        run_btn = st.button("Run Comparison", type="primary", use_container_width=True)
+    if not run_btn:
+        st.info("Upload one cancer case and click Generate Before/After GIFs.")
+        return
 
-    run_tab, load_tab = st.tabs(["Run New Comparison", "Load Saved model_output.json"])
+    if not uploads:
+        st.error("Please upload cancer DICOM files first.")
+        return
 
-    with load_tab:
-        st.caption("Use an existing run payload to populate the UI without rerunning the model.")
-        saved_payload_file = st.file_uploader(
-            "Upload model_output.json",
-            type=["json"],
-            key="saved_model_output_json",
-        )
-        render_saved_btn = st.button("Render Saved Output", use_container_width=True, key="render_saved_btn")
+    model_abs = os.path.abspath(model_path)
+    if not os.path.exists(model_abs):
+        st.error(f"Model file not found: `{model_abs}`")
+        return
 
-        if render_saved_btn:
-            if not saved_payload_file:
-                st.error("Please upload a model_output.json file first.")
-            else:
-                try:
-                    payload = parse_saved_payload(saved_payload_file)
-                    before_saved = payload.get("before")
-                    after_saved = payload["after"]
-                    render_comparison_outputs(before_saved, after_saved)
-                except Exception as e:
-                    st.exception(e)
+    seed_everything(42)
+    run_id = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    run_dir = os.path.join(output_root, run_id)
+    upload_dir = os.path.join(run_dir, "uploaded_cancer")
+    os.makedirs(run_dir, exist_ok=True)
+    t0 = time.time()
 
-    with run_tab:
-        uploads = st.file_uploader(
-            "Upload cancer DICOM files or ZIP (single case)",
-            accept_multiple_files=True,
-            key="cancer_uploads",
-        )
-        st.caption("Healthy trial uploads are not required. This run will use your cached AFTER model.")
+    before_gif_path = os.path.join(run_dir, "before_treatment.gif")
+    after_gif_path = os.path.join(run_dir, "after_treatment.gif")
 
-        if not run_btn:
-            st.info("Set paths and upload files, then click Run Comparison.")
-            return
+    with st.status("Running model and rendering GIFs...", expanded=True) as status:
+        try:
+            st.write("Saving upload...")
+            cancer_dir = save_uploaded_files(uploads, upload_dir)
+            st.write(f"Cancer folder: `{cancer_dir}`")
 
-        if not uploads:
-            st.error("Please upload cancer files first.")
-            return
+            st.write("Preparing slices...")
+            case = prepare_cancer_case(cancer_dir, max_slices=int(max_slices))
+            dicom_files = case["dicom_files"]
 
-        seed_everything(42)
+            st.write("Loading model...")
+            model = load_model_cached(model_abs)
 
-        healthy_paths = parse_paths(healthy_paths_raw)
-        if healthy_paths:
-            try:
-                validate_healthy_paths(healthy_paths, "HEALTHY")
-            except Exception as e:
-                st.error(str(e))
-                return
-        if run_before_pipeline and not healthy_paths:
-            st.error("BEFORE pipeline requires healthy folders. Add healthy paths in the sidebar.")
-            return
-
-        allow_after_training = not reuse_cached_model_only
-        abs_model_path = os.path.abspath(model_path) if model_path else ""
-        if reuse_cached_model_only and (not abs_model_path or not os.path.exists(abs_model_path)):
-            st.error(
-                f"Cached AFTER model not found at `{abs_model_path}`. "
-                "Provide the model file or uncheck `Reuse cached AFTER model only`."
+            st.write("Detecting lesion regions...")
+            lesions = detect_lesions_with_model(
+                model=model,
+                norm_slices=case["norm_slices"],
+                valid_masks=case["valid_masks"],
             )
+
+            st.write("Rendering BEFORE GIF...")
+            make_before_gif(
+                u8_slices=case["u8_slices"],
+                lesions=lesions,
+                out_path=before_gif_path,
+                fps=int(fps),
+                max_frames=int(max_frames),
+            )
+
+            st.write("Running treatment simulation and rendering AFTER GIF...")
+            active_map = build_active_map(lesions, case["gray_masks"], min_pixels=18)
+            y_mm, x_mm = get_pixel_spacing_mm(dicom_files[0])
+            px_radius = max(1, int(round(2.5 / ((y_mm + x_mm) / 2.0))))
+            treatment = run_treatment_and_make_after_gif(
+                active_global=active_map,
+                u8_slices=case["u8_slices"],
+                gray_masks=case["gray_masks"],
+                out_path=after_gif_path,
+                px_radius=px_radius,
+                fps=int(fps),
+                frame_stride=int(frame_stride),
+                max_frames=int(max_frames),
+            )
+
+            payload = {
+                "run_id": run_id,
+                "timestamp_utc": datetime.utcnow().isoformat() + "Z",
+                "model_path": model_abs,
+                "cancer_dir": cancer_dir,
+                "slices_processed": len(dicom_files),
+                "before_gif_path": before_gif_path,
+                "after_gif_path": after_gif_path,
+                "treatment_summary": treatment,
+                "runtime_seconds": round(time.time() - t0, 2),
+            }
+            payload_path = os.path.join(run_dir, "model_output.json")
+            with open(payload_path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2)
+
+            status.update(label="Completed", state="complete")
+        except Exception as e:
+            status.update(label="Failed", state="error")
+            st.exception(e)
             return
 
-        run_id = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-        run_dir = os.path.join(output_root, run_id)
-        before_dir = os.path.join(run_dir, "before")
-        after_dir = os.path.join(run_dir, "after")
-        upload_dir = os.path.join(run_dir, "uploaded_cancer")
-        os.makedirs(run_dir, exist_ok=True)
-        before = None
-
-        with st.status("Running pipelines...", expanded=True) as status:
-            try:
-                st.write("Saving cancer uploads...")
-                cancer_path = save_uploaded_files(uploads, upload_dir)
-                st.write(f"Cancer input folder: `{cancer_path}`")
-
-                if run_before_pipeline:
-                    st.write("Running BEFORE...")
-                    before = run_before(
-                        cancer_path=cancer_path,
-                        healthy_paths=healthy_paths,
-                        out_dir=before_dir,
-                        make_gif=make_gif,
-                        fps=int(fps),
-                        frame_stride=int(frame_stride),
-                        max_gif_frames=int(max_gif_frames),
-                        max_slices=int(max_slices),
-                    )
-                else:
-                    st.write("Skipping BEFORE (disabled).")
-
-                st.write("Running AFTER...")
-                after = run_after(
-                    cancer_path=cancer_path,
-                    healthy_paths=healthy_paths,
-                    out_dir=after_dir,
-                    model_path=model_path,
-                    force_retrain_model=force_retrain,
-                    allow_after_training=allow_after_training,
-                    make_gif=make_gif,
-                    fps=int(fps),
-                    frame_stride=int(frame_stride),
-                    max_gif_frames=int(max_gif_frames),
-                    max_slices=int(max_slices),
-                    ae_train_epochs=int(ae_train_epochs),
-                    ae_max_train_samples=int(ae_max_train_samples),
-                )
-
-                status.update(label="Completed", state="complete")
-            except Exception as e:
-                status.update(label="Failed", state="error")
-                st.exception(e)
-                return
-
-        cmp_df = render_comparison_outputs(before, after)
-
-        payload = {
-            "run_id": run_id,
-            "timestamp_utc": datetime.utcnow().isoformat() + "Z",
-            "cancer_path": cancer_path,
-            "healthy_paths": healthy_paths,
-            "run_before_pipeline": bool(run_before_pipeline),
-            "run_settings": {
-                "make_gif": bool(make_gif),
-                "fps": int(fps),
-                "frame_stride": int(frame_stride),
-                "max_gif_frames": int(max_gif_frames),
-                "max_slices": int(max_slices),
-                "reuse_cached_model_only": bool(reuse_cached_model_only),
-                "force_retrain_after_model": bool(force_retrain),
-                "ae_train_epochs": int(ae_train_epochs),
-                "ae_max_train_samples": int(ae_max_train_samples),
-            },
-            "before": before,
-            "after": after,
-            "comparison_metrics": cmp_df.reset_index().to_dict(orient="records"),
-        }
-        payload_path = os.path.join(run_dir, "model_output.json")
-        with open(payload_path, "w", encoding="utf-8") as f:
-            json.dump(payload, f, indent=2)
-
-        st.success(f"Saved run outputs to `{run_dir}`")
+    col1, col2 = st.columns(2)
+    with col1:
+        st.subheader("Before GIF")
+        st.image(before_gif_path)
         st.download_button(
-            "Download model_output.json",
-            data=json.dumps(payload, indent=2),
-            file_name=f"{run_id}_model_output.json",
-            mime="application/json",
+            "Download before_treatment.gif",
+            data=read_bytes(before_gif_path),
+            file_name="before_treatment.gif",
+            mime="image/gif",
         )
+
+    with col2:
+        st.subheader("After GIF")
+        st.image(after_gif_path)
+        st.download_button(
+            "Download after_treatment.gif",
+            data=read_bytes(after_gif_path),
+            file_name="after_treatment.gif",
+            mime="image/gif",
+        )
+
+    st.success(f"Done. GIFs saved under `{run_dir}`")
 
 
 if __name__ == "__main__":
