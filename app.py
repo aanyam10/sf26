@@ -19,6 +19,7 @@ from scipy import ndimage
 
 
 DEFAULT_MODEL_PATH = "model_cache/after_ae_model.keras"
+DEFAULT_BASELINE_PATH = "baseline_cache/healthy_baseline.npz"
 DEFAULT_OUTPUT_ROOT = "outputs"
 
 
@@ -110,8 +111,6 @@ def get_pixel_spacing_mm(path: str) -> Tuple[float, float]:
     ds = pydicom.dcmread(path, stop_before_pixels=True, force=True)
     px = getattr(ds, "PixelSpacing", [1.0, 1.0])
     return float(px[0]), float(px[1])
-
-
 def resize_2d(img: np.ndarray, target_shape: Tuple[int, int], order: int = 1) -> np.ndarray:
     if img.shape == target_shape:
         return img
@@ -156,6 +155,71 @@ def robust_positive_z(arr: np.ndarray, valid: np.ndarray) -> np.ndarray:
     mad = np.median(np.abs(vals - med)) + 1e-6
     z = 0.6745 * (arr - med) / mad
     return np.clip(z, 0.0, None).astype(np.float32)
+
+
+def remove_small_components_3d(mask3d: np.ndarray, min_vox: int = 40, min_span: int = 1) -> np.ndarray:
+    lab, n = ndimage.label(mask3d)
+    if n == 0:
+        return np.zeros_like(mask3d, dtype=bool)
+    keep_ids = []
+    for cid in range(1, n + 1):
+        pts = np.argwhere(lab == cid)
+        if pts.shape[0] < min_vox:
+            continue
+        zspan = int(pts[:, 0].max() - pts[:, 0].min() + 1)
+        if zspan < min_span:
+            continue
+        keep_ids.append(cid)
+    if not keep_ids:
+        return np.zeros_like(mask3d, dtype=bool)
+    return np.isin(lab, keep_ids)
+
+
+def temporal_majority_3d(mask3d: np.ndarray, min_support: int = 2) -> np.ndarray:
+    m = mask3d.astype(np.uint8)
+    acc = m.copy()
+    acc[1:] += m[:-1]
+    acc[:-1] += m[1:]
+    out = acc >= min_support
+    if out.sum() == 0 and mask3d.sum() > 0:
+        return mask3d
+    return out
+
+
+def neurosymbolic_cleanup(mask3d: np.ndarray, min_px: int = 18, min_vox: int = 40, min_span: int = 1) -> np.ndarray:
+    out = np.zeros_like(mask3d, dtype=bool)
+    for z in range(mask3d.shape[0]):
+        m = ndimage.binary_opening(mask3d[z], structure=np.ones((3, 3)))
+        m = ndimage.binary_closing(m, structure=np.ones((5, 5)))
+        out[z] = remove_small_blobs(m, min_pixels=min_px)
+    out = temporal_majority_3d(out, min_support=2)
+    out3 = remove_small_components_3d(out, min_vox=min_vox, min_span=min_span)
+    return out3 if out3.sum() > 0 else out
+
+
+def topk_fallback_3d(score3d: np.ndarray, valid3d: np.ndarray, ratio: float = 0.006, min_per_slice: int = 14) -> np.ndarray:
+    out = np.zeros_like(valid3d, dtype=bool)
+    for z in range(score3d.shape[0]):
+        valid_idx = np.flatnonzero(valid3d[z].ravel())
+        if valid_idx.size == 0:
+            continue
+        k = max(min_per_slice, int(valid_idx.size * ratio))
+        if k >= valid_idx.size:
+            chosen = valid_idx
+        else:
+            vals = score3d[z].ravel()[valid_idx]
+            chosen = valid_idx[np.argpartition(vals, -k)[-k:]]
+        out[z].ravel()[chosen] = True
+    return out
+
+
+def max_lung_width_px(mask3d: np.ndarray) -> int:
+    widths = []
+    for z in range(mask3d.shape[0]):
+        _, xs = np.where(mask3d[z])
+        if xs.size:
+            widths.append(int(xs.max() - xs.min() + 1))
+    return max(widths) if widths else 1
 
 
 def evenly_spaced_indices(total: int, limit: int) -> List[int]:
@@ -238,6 +302,36 @@ def load_model_cached(path: str):
             ) from weights_err
 
 
+@st.cache_data(show_spinner=False)
+def load_baseline_cached(path: str) -> np.ndarray:
+    data = np.load(path)
+    if "baseline" not in data:
+        raise RuntimeError(f"`{path}` must contain key `baseline`.")
+    baseline = data["baseline"].astype(np.float32)
+    if baseline.ndim != 3:
+        raise RuntimeError(f"`baseline` in `{path}` must be 3D: (slices, H, W).")
+    return baseline
+
+
+def prepare_baseline_for_case(
+    baseline_3d: np.ndarray,
+    target_shape: Tuple[int, int],
+    target_slices: int,
+) -> np.ndarray:
+    if baseline_3d.shape[1:] != target_shape:
+        resized = np.stack([resize_2d(s, target_shape, order=1) for s in baseline_3d], axis=0).astype(np.float32)
+    else:
+        resized = baseline_3d
+
+    if resized.shape[0] == target_slices:
+        return resized
+
+    idx = np.linspace(0, resized.shape[0] - 1, num=target_slices)
+    idx = np.round(idx).astype(int)
+    idx = np.clip(idx, 0, resized.shape[0] - 1)
+    return resized[idx]
+
+
 def prepare_cancer_case(cancer_dir: str, max_slices: int) -> Dict[str, object]:
     dicom_files = get_sorted_dicom_files(cancer_dir)
     if not dicom_files:
@@ -250,6 +344,7 @@ def prepare_cancer_case(cancer_dir: str, max_slices: int) -> Dict[str, object]:
     norm_slices: List[np.ndarray] = []
     u8_slices: List[np.ndarray] = []
     gray_masks: List[np.ndarray] = []
+    lung_masks: List[np.ndarray] = []
     valid_masks: List[np.ndarray] = []
 
     ref_shape = None
@@ -274,6 +369,7 @@ def prepare_cancer_case(cancer_dir: str, max_slices: int) -> Dict[str, object]:
         norm_slices.append(norm)
         u8_slices.append((norm * 255.0).astype(np.uint8))
         gray_masks.append(gray)
+        lung_masks.append(lung)
         valid_masks.append(valid)
 
         if (i + 1) % 25 == 0:
@@ -285,6 +381,7 @@ def prepare_cancer_case(cancer_dir: str, max_slices: int) -> Dict[str, object]:
         "norm_slices": norm_slices,
         "u8_slices": u8_slices,
         "gray_masks": gray_masks,
+        "lung_masks": lung_masks,
         "valid_masks": valid_masks,
     }
 
@@ -293,6 +390,8 @@ def detect_lesions_with_model(
     model,
     norm_slices: List[np.ndarray],
     valid_masks: List[np.ndarray],
+    baseline_slices: Optional[np.ndarray] = None,
+    baseline_weight: float = 0.85,
     min_pixels: int = 18,
 ) -> List[np.ndarray]:
     if not norm_slices:
@@ -310,46 +409,53 @@ def detect_lesions_with_model(
     pred = model.predict(x, batch_size=8, verbose=0)
     err_small = np.abs(x - pred)[..., 0]
 
-    lesions: List[np.ndarray] = []
-    fallback_scores: List[np.ndarray] = []
-    for i in range(len(norm_slices)):
-        err = resize_2d(err_small[i], norm_slices[i].shape, order=1)
-        z = robust_positive_z(err, valid_masks[i])
-        vals = z[valid_masks[i]] if np.any(valid_masks[i]) else z.ravel()
+    ae_err_3d = np.stack(
+        [resize_2d(err_small[i], norm_slices[i].shape, order=1) for i in range(len(norm_slices))],
+        axis=0,
+    ).astype(np.float32)
+    valid_3d = np.stack(valid_masks, axis=0).astype(bool)
 
-        hi = float(np.percentile(vals, 98.5))
-        lo = float(np.percentile(vals, 96.5))
+    if baseline_slices is not None:
+        diff_3d = np.abs(np.stack(norm_slices, axis=0).astype(np.float32) - baseline_slices.astype(np.float32))
+    else:
+        diff_3d = np.zeros_like(ae_err_3d, dtype=np.float32)
 
-        mask = z > hi
-        for _ in range(1):
-            mask |= ndimage.binary_dilation(mask, structure=np.ones((3, 3))) & (z > lo)
-        mask &= valid_masks[i]
-        mask = ndimage.binary_opening(mask, structure=np.ones((3, 3)))
-        mask = ndimage.binary_closing(mask, structure=np.ones((5, 5)))
-        mask = remove_small_blobs(mask, min_pixels=min_pixels).astype(bool)
+    diff_z = np.zeros_like(diff_3d, dtype=np.float32)
+    ae_z = np.zeros_like(ae_err_3d, dtype=np.float32)
+    for z in range(ae_err_3d.shape[0]):
+        diff_z[z] = robust_positive_z(diff_3d[z], valid_3d[z])
+        ae_z[z] = robust_positive_z(ae_err_3d[z], valid_3d[z])
 
-        lesions.append(mask)
-        fallback_scores.append(z)
+    if baseline_slices is not None:
+        score = float(baseline_weight) * diff_z + (1.0 - float(baseline_weight)) * ae_z
+    else:
+        score = ae_z
 
-    if int(sum(m.sum() for m in lesions)) == 0:
-        lesions = []
-        for i, score in enumerate(fallback_scores):
-            valid = valid_masks[i]
-            out = np.zeros_like(valid, dtype=bool)
-            valid_idx = np.flatnonzero(valid.ravel())
-            if valid_idx.size == 0:
-                lesions.append(out)
-                continue
-            k = max(14, int(valid_idx.size * 0.006))
-            vals = score.ravel()[valid_idx]
-            if k >= valid_idx.size:
-                chosen = valid_idx
-            else:
-                chosen = valid_idx[np.argpartition(vals, -k)[-k:]]
-            out.ravel()[chosen] = True
-            out = remove_small_blobs(out, min_pixels=min_pixels).astype(bool)
-            lesions.append(out)
+    lesion_3d = None
+    vals = score[valid_3d] if np.any(valid_3d) else score.ravel()
+    for p in [99.2, 98.8, 98.3, 97.8, 97.2, 96.5]:
+        hi = float(np.percentile(vals, p))
+        lo = float(np.percentile(vals, max(90.0, p - 2.5)))
+        seed = (score > hi) & valid_3d
+        cand = seed.copy()
+        for _ in range(2):
+            cand |= ndimage.binary_dilation(cand, structure=np.ones((1, 3, 3))) & (score > lo) & valid_3d
+        cand = neurosymbolic_cleanup(cand, min_px=min_pixels, min_vox=40, min_span=1)
+        if int(cand.sum()) >= 40:
+            lesion_3d = cand
+            break
 
+    if lesion_3d is None:
+        lesion_3d = neurosymbolic_cleanup(
+            topk_fallback_3d(score, valid_3d, ratio=0.006, min_per_slice=14),
+            min_px=min_pixels,
+            min_vox=40,
+            min_span=1,
+        )
+
+    lesions = [lesion_3d[z].astype(bool) for z in range(lesion_3d.shape[0])]
+    for z in range(len(lesions)):
+        lesions[z] = ndimage.binary_dilation(lesions[z], structure=np.ones((3, 3))) & valid_masks[z]
     return lesions
 
 
@@ -369,7 +475,8 @@ def save_gif(frames: List[Image.Image], out_path: str, fps: int) -> None:
 
 def make_before_gif(
     u8_slices: List[np.ndarray],
-    lesions: List[np.ndarray],
+    active_global: np.ndarray,
+    gray_masks: List[np.ndarray],
     out_path: str,
     fps: int,
     max_frames: int,
@@ -383,7 +490,7 @@ def make_before_gif(
     for idx in order:
         bg = u8_slices[idx]
         rgb = np.repeat(bg[..., None], 3, axis=2)
-        m = lesions[idx]
+        m = active_global & gray_masks[idx]
         rgb[m, 0] = 255
         rgb[m, 1] = 255
         rgb[m, 2] = 0
@@ -506,13 +613,23 @@ def main() -> None:
     with st.sidebar:
         st.subheader("Model")
         model_path = st.text_input("Model path", value=DEFAULT_MODEL_PATH)
+        use_baseline = st.checkbox("Use precomputed healthy baseline", value=True)
+        baseline_path = st.text_input("Baseline path", value=DEFAULT_BASELINE_PATH)
+        baseline_weight = st.slider(
+            "Baseline score weight",
+            min_value=0.0,
+            max_value=1.0,
+            value=0.85,
+            step=0.05,
+            help="Final score = weight * baseline-diff + (1-weight) * model reconstruction error.",
+        )
 
         st.subheader("Output")
         output_root = st.text_input("Output root", value=DEFAULT_OUTPUT_ROOT)
         fps = st.number_input("GIF FPS", min_value=1, max_value=30, value=12)
         frame_stride = st.number_input("Treatment frame stride", min_value=1, max_value=30, value=6)
-        max_frames = st.number_input("Max GIF frames", min_value=30, max_value=2000, value=320)
-        max_slices = st.number_input("Max slices to process", min_value=20, max_value=1200, value=140)
+        max_frames = st.number_input("Max GIF frames", min_value=30, max_value=2000, value=900)
+        max_slices = st.number_input("Max slices to process", min_value=20, max_value=1200, value=500)
 
         run_btn = st.button("Generate Before/After GIFs", type="primary", use_container_width=True)
 
@@ -554,6 +671,19 @@ def main() -> None:
             case = prepare_cancer_case(cancer_dir, max_slices=int(max_slices))
             dicom_files = case["dicom_files"]
 
+            baseline_slices = None
+            baseline_abs = os.path.abspath(baseline_path)
+            if use_baseline:
+                st.write("Loading healthy baseline...")
+                if not os.path.exists(baseline_abs):
+                    raise FileNotFoundError(f"Baseline file not found: `{baseline_abs}`")
+                baseline_3d = load_baseline_cached(baseline_abs)
+                baseline_slices = prepare_baseline_for_case(
+                    baseline_3d=baseline_3d,
+                    target_shape=case["norm_slices"][0].shape,
+                    target_slices=len(case["norm_slices"]),
+                )
+
             st.write("Loading model...")
             model = load_model_cached(model_abs)
 
@@ -562,21 +692,25 @@ def main() -> None:
                 model=model,
                 norm_slices=case["norm_slices"],
                 valid_masks=case["valid_masks"],
+                baseline_slices=baseline_slices,
+                baseline_weight=float(baseline_weight),
             )
+            active_map = build_active_map(lesions, case["gray_masks"], min_pixels=18)
 
             st.write("Rendering BEFORE GIF...")
             make_before_gif(
                 u8_slices=case["u8_slices"],
-                lesions=lesions,
+                active_global=active_map,
+                gray_masks=case["gray_masks"],
                 out_path=before_gif_path,
                 fps=int(fps),
                 max_frames=int(max_frames),
             )
 
             st.write("Running treatment simulation and rendering AFTER GIF...")
-            active_map = build_active_map(lesions, case["gray_masks"], min_pixels=18)
-            y_mm, x_mm = get_pixel_spacing_mm(dicom_files[0])
-            px_radius = max(1, int(round(2.5 / ((y_mm + x_mm) / 2.0))))
+            lung3d = np.stack(case["lung_masks"], axis=0).astype(bool)
+            px_per_mm = max_lung_width_px(lung3d) / 300.0
+            px_radius = max(1, int(round((5.0 / 2.0) * px_per_mm)))
             treatment = run_treatment_and_make_after_gif(
                 active_global=active_map,
                 u8_slices=case["u8_slices"],
@@ -592,11 +726,15 @@ def main() -> None:
                 "run_id": run_id,
                 "timestamp_utc": datetime.utcnow().isoformat() + "Z",
                 "model_path": model_abs,
+                "use_baseline": bool(use_baseline),
+                "baseline_path": baseline_abs if use_baseline else "",
+                "baseline_weight": float(baseline_weight),
                 "cancer_dir": cancer_dir,
                 "slices_processed": len(dicom_files),
                 "before_gif_path": before_gif_path,
                 "after_gif_path": after_gif_path,
                 "treatment_summary": treatment,
+                "beam_radius_px": int(px_radius),
                 "runtime_seconds": round(time.time() - t0, 2),
             }
             payload_path = os.path.join(run_dir, "model_output.json")
