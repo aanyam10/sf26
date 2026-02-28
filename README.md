@@ -36,16 +36,17 @@ streamlit run app.py
 ## Usage
 
 1. In sidebar, choose healthy input mode:
-   - `Upload healthy DICOM files` (recommended for Streamlit Cloud), or
+   - `Bundled trial folders (repo)` (no healthy uploads each run), or
+   - `Upload healthy DICOM files` (recommended for Streamlit Cloud if healthy folders are not bundled), or
    - `Local folder paths` (for local runs on your machine).
 2. Upload one cancer case (DICOM files or zip).
 3. If using upload mode, upload healthy trials for `trial1`, `trial2`, `trial3` in the Run tab.
 4. Keep cached model path as `model_cache/after_ae_model.keras`.
-5. Leave `Force retrain AFTER model` unchecked for reuse.
+5. Keep `Reuse cached AFTER model only (no retraining)` enabled to avoid retraining on cloud.
 6. For Streamlit Cloud stability, keep:
    - `Generate GIFs` off unless needed
    - `Max slices to process per run` around `80-150`
-   - lower `AFTER model train epochs` if retraining
+   - lower `AFTER model train epochs` if retraining is enabled
 7. Click **Run Comparison**.
 
 First run:

@@ -218,6 +218,14 @@ def parse_paths(text: str) -> List[str]:
     return [line.strip() for line in text.splitlines() if line.strip()]
 
 
+def get_bundled_trial_paths() -> List[str]:
+    return [
+        os.path.join("data", "healthy", "trial1"),
+        os.path.join("data", "healthy", "trial2"),
+        os.path.join("data", "healthy", "trial3"),
+    ]
+
+
 def evenly_spaced_indices(total: int, limit: int) -> List[int]:
     if limit <= 0 or total <= limit:
         return list(range(total))
@@ -687,6 +695,7 @@ def load_or_train_after_model(
     force_retrain: bool = False,
     max_train_samples: int = 600,
     train_epochs: int = 4,
+    allow_training: bool = True,
 ):
     tf = get_tf()
     if not healthy_ae:
@@ -695,6 +704,11 @@ def load_or_train_after_model(
     abs_path = os.path.abspath(model_path) if model_path else ""
     if abs_path and os.path.exists(abs_path) and not force_retrain:
         return load_model_cached(abs_path), False
+
+    if not allow_training:
+        raise FileNotFoundError(
+            f"Cached AFTER model not found at `{abs_path}`. Provide a valid model path or enable retraining."
+        )
 
     x_train = np.stack(healthy_ae, axis=0).astype(np.float32)
     if x_train.shape[0] > max_train_samples:
@@ -722,6 +736,7 @@ def run_after(
     out_dir: str,
     model_path: str,
     force_retrain_model: bool,
+    allow_after_training: bool,
     make_gif: bool,
     fps: int,
     frame_stride: int,
@@ -802,6 +817,7 @@ def run_after(
         force_retrain=force_retrain_model,
         max_train_samples=ae_max_train_samples,
         train_epochs=ae_train_epochs,
+        allow_training=allow_after_training,
     )
     x_cancer = np.stack(cancer_ae, axis=0).astype(np.float32)[..., None]
     pred = model.predict(x_cancer, batch_size=8, verbose=0)
@@ -909,15 +925,24 @@ def main() -> None:
 
     with st.sidebar:
         st.subheader("Healthy Data Source")
+        bundled_trial_paths = get_bundled_trial_paths()
+        bundled_paths_available = all(os.path.isdir(p) for p in bundled_trial_paths)
         healthy_input_mode = st.radio(
             "How should healthy reference data be provided?",
-            options=["Upload healthy DICOM files", "Local folder paths"],
-            index=0,
+            options=["Bundled trial folders (repo)", "Upload healthy DICOM files", "Local folder paths"],
+            index=(0 if bundled_paths_available else 1),
         )
 
         before_paths_raw = ""
         after_paths_raw = ""
-        if healthy_input_mode == "Local folder paths":
+        if healthy_input_mode == "Bundled trial folders (repo)":
+            st.subheader("Bundled Healthy Paths")
+            st.code("\n".join(bundled_trial_paths), language="text")
+            if bundled_paths_available:
+                st.caption("Bundled trial folders found. No healthy upload required.")
+            else:
+                st.warning("Bundled trial folders are missing. Add them to the repo or choose another input mode.")
+        elif healthy_input_mode == "Local folder paths":
             st.subheader("Healthy Paths")
             before_paths_raw = st.text_area(
                 "BEFORE healthy folders (one per line)",
@@ -935,7 +960,14 @@ def main() -> None:
         st.subheader("Run Settings")
         output_root = st.text_input("Output root", value="outputs")
         model_path = st.text_input("Cached AFTER model path", value="model_cache/after_ae_model.keras")
-        force_retrain = st.checkbox("Force retrain AFTER model", value=False)
+        reuse_cached_model_only = st.checkbox("Reuse cached AFTER model only (no retraining)", value=True)
+        force_retrain = st.checkbox(
+            "Force retrain AFTER model",
+            value=False,
+            disabled=reuse_cached_model_only,
+        )
+        if reuse_cached_model_only:
+            force_retrain = False
 
         st.subheader("GIF")
         make_gif = st.checkbox("Generate GIFs", value=False)
@@ -1042,8 +1074,10 @@ def main() -> None:
                         key="after_trial3_uploads",
                     ),
                 ]
-        else:
+        elif healthy_input_mode == "Local folder paths":
             st.caption("Using local healthy paths configured in the sidebar.")
+        else:
+            st.caption("Using bundled healthy trial folders from the repository.")
 
         if not run_btn:
             st.info("Set paths and upload files, then click Run Comparison.")
@@ -1054,6 +1088,14 @@ def main() -> None:
             return
 
         seed_everything(42)
+        allow_after_training = not reuse_cached_model_only
+        abs_model_path = os.path.abspath(model_path) if model_path else ""
+        if reuse_cached_model_only and (not abs_model_path or not os.path.exists(abs_model_path)):
+            st.error(
+                f"Cached AFTER model not found at `{abs_model_path}`. "
+                "Provide the model file or uncheck `Reuse cached AFTER model only`."
+            )
+            return
 
         run_id = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
         run_dir = os.path.join(output_root, run_id)
@@ -1068,6 +1110,15 @@ def main() -> None:
         if healthy_input_mode == "Local folder paths":
             before_paths = parse_paths(before_paths_raw)
             after_paths = parse_paths(after_paths_raw)
+            try:
+                validate_healthy_paths(before_paths, "BEFORE")
+                validate_healthy_paths(after_paths, "AFTER")
+            except Exception as e:
+                st.error(str(e))
+                return
+        elif healthy_input_mode == "Bundled trial folders (repo)":
+            before_paths = get_bundled_trial_paths()
+            after_paths = before_paths.copy()
             try:
                 validate_healthy_paths(before_paths, "BEFORE")
                 validate_healthy_paths(after_paths, "AFTER")
@@ -1124,6 +1175,7 @@ def main() -> None:
                     out_dir=after_dir,
                     model_path=model_path,
                     force_retrain_model=force_retrain,
+                    allow_after_training=allow_after_training,
                     make_gif=make_gif,
                     fps=int(fps),
                     frame_stride=int(frame_stride),
@@ -1154,6 +1206,8 @@ def main() -> None:
                 "frame_stride": int(frame_stride),
                 "max_gif_frames": int(max_gif_frames),
                 "max_slices": int(max_slices),
+                "reuse_cached_model_only": bool(reuse_cached_model_only),
+                "force_retrain_after_model": bool(force_retrain),
                 "ae_train_epochs": int(ae_train_epochs),
                 "ae_max_train_samples": int(ae_max_train_samples),
             },
