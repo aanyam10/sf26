@@ -218,14 +218,6 @@ def parse_paths(text: str) -> List[str]:
     return [line.strip() for line in text.splitlines() if line.strip()]
 
 
-def get_bundled_trial_paths() -> List[str]:
-    return [
-        os.path.join("data", "healthy", "trial1"),
-        os.path.join("data", "healthy", "trial2"),
-        os.path.join("data", "healthy", "trial3"),
-    ]
-
-
 def evenly_spaced_indices(total: int, limit: int) -> List[int]:
     if limit <= 0 or total <= limit:
         return list(range(total))
@@ -250,14 +242,15 @@ def parse_saved_payload(uploaded_json) -> Dict[str, object]:
     payload = json.loads(raw)
     if not isinstance(payload, dict):
         raise ValueError("model_output.json must contain a JSON object.")
-    if "before" not in payload or "after" not in payload:
-        raise ValueError("model_output.json must include both `before` and `after` sections.")
-    if not isinstance(payload["before"], dict) or not isinstance(payload["after"], dict):
-        raise ValueError("`before` and `after` fields must be JSON objects.")
+    if "after" not in payload or not isinstance(payload["after"], dict):
+        raise ValueError("model_output.json must include an `after` section as a JSON object.")
+    if "before" in payload and payload["before"] is not None and not isinstance(payload["before"], dict):
+        raise ValueError("`before` must be a JSON object when provided.")
     return payload
 
 
-def build_comparison_df(before: Dict[str, object], after: Dict[str, object]) -> pd.DataFrame:
+def build_comparison_df(before: Optional[Dict[str, object]], after: Dict[str, object]) -> pd.DataFrame:
+    before = before or {}
     metrics = [
         "initial_total_cancer_pixels",
         "treated_total_pixels",
@@ -276,7 +269,8 @@ def build_comparison_df(before: Dict[str, object], after: Dict[str, object]) -> 
     ).set_index("metric")
 
 
-def render_comparison_outputs(before: Dict[str, object], after: Dict[str, object]) -> pd.DataFrame:
+def render_comparison_outputs(before: Optional[Dict[str, object]], after: Dict[str, object]) -> pd.DataFrame:
+    before = before or {}
     cmp_df = build_comparison_df(before, after)
 
     st.subheader("Metrics")
@@ -320,7 +314,7 @@ def render_comparison_outputs(before: Dict[str, object], after: Dict[str, object
         if before_gif and os.path.exists(before_gif):
             st.image(before_gif, use_container_width=True)
         else:
-            st.info("Before GIF not found at saved path.")
+            st.info("Before GIF not available (pipeline may have been skipped).")
         st.caption(f"GIF: `{before_gif}`")
 
     with col2:
@@ -698,9 +692,6 @@ def load_or_train_after_model(
     allow_training: bool = True,
 ):
     tf = get_tf()
-    if not healthy_ae:
-        raise RuntimeError("No healthy slices available to train/load AFTER model.")
-
     abs_path = os.path.abspath(model_path) if model_path else ""
     if abs_path and os.path.exists(abs_path) and not force_retrain:
         return load_model_cached(abs_path), False
@@ -709,6 +700,9 @@ def load_or_train_after_model(
         raise FileNotFoundError(
             f"Cached AFTER model not found at `{abs_path}`. Provide a valid model path or enable retraining."
         )
+
+    if not healthy_ae:
+        raise RuntimeError("No healthy slices available to train AFTER model.")
 
     x_train = np.stack(healthy_ae, axis=0).astype(np.float32)
     if x_train.shape[0] > max_train_samples:
@@ -748,12 +742,13 @@ def run_after(
     os.makedirs(out_dir, exist_ok=True)
     t0 = time.time()
 
-    healthy_files = [get_sorted_dicom_files(p) for p in healthy_paths]
+    use_healthy_reference = len(healthy_paths) > 0
+    healthy_files = [get_sorted_dicom_files(p) for p in healthy_paths] if use_healthy_reference else []
     cancer_files = get_sorted_dicom_files(cancer_path)
-    n = min([len(cancer_files)] + [len(hf) for hf in healthy_files])
+    n = min([len(cancer_files)] + [len(hf) for hf in healthy_files]) if use_healthy_reference else len(cancer_files)
     if n == 0:
         raise RuntimeError("No slices found.")
-    healthy_files = [hf[:n] for hf in healthy_files]
+    healthy_files = [hf[:n] for hf in healthy_files] if use_healthy_reference else []
     cancer_files = cancer_files[:n]
     original_n = n
 
@@ -777,15 +772,18 @@ def run_after(
         c_n = ct_window_norm(c)
         ct_slices_u8.append((c_n * 255.0).astype(np.uint8))
 
-        healthy_norms = []
-        for hf in healthy_files:
-            h = resize_2d(read_hu(hf[i]), ref_shape, order=1)
-            h_n = ct_window_norm(h)
-            healthy_norms.append(h_n)
-            healthy_ae.append(resize_2d(h_n, ae_hw, order=1))
-
-        baseline = np.median(np.stack(healthy_norms, axis=0), axis=0)
-        diff = np.abs(c_n - baseline)
+        if use_healthy_reference:
+            healthy_norms = []
+            for hf in healthy_files:
+                h = resize_2d(read_hu(hf[i]), ref_shape, order=1)
+                h_n = ct_window_norm(h)
+                healthy_norms.append(h_n)
+                healthy_ae.append(resize_2d(h_n, ae_hw, order=1))
+            baseline = np.median(np.stack(healthy_norms, axis=0), axis=0)
+            diff = np.abs(c_n - baseline)
+        else:
+            # Model-only mode: anomaly score relies on AE reconstruction error.
+            diff = np.zeros_like(c_n, dtype=np.float32)
 
         lmask = lung_mask_2d(c)
         gmask = (c_n >= 0.10) & (c_n <= 0.85)
@@ -830,7 +828,7 @@ def run_after(
     for z in range(n):
         diff_z[z] = robust_positive_z(diff_3d[z], valid_3d[z])
         ae_z[z] = robust_positive_z(ae_err[z], valid_3d[z])
-    score = 0.85 * diff_z + 0.15 * ae_z
+    score = (0.85 * diff_z + 0.15 * ae_z) if use_healthy_reference else ae_z
 
     lesion_3d = None
     used_pct = None
@@ -909,6 +907,7 @@ def run_after(
         "gif_path": gif_path,
         "model_path": os.path.abspath(model_path) if model_path else "",
         "model_retrained": bool(trained_now),
+        "used_healthy_reference": bool(use_healthy_reference),
     }
     return {k: as_py(v) for k, v in summary.items()}
 
@@ -921,41 +920,20 @@ def run_after(
 def main() -> None:
     st.set_page_config(page_title="Before vs After DICOM Comparator", layout="wide")
     st.title("Before vs After DICOM Comparator")
-    st.caption("Upload one cancer case once, run both pipelines, and compare GIFs side by side.")
+    st.caption("Upload one cancer case, reuse cached AFTER model, and compare outputs.")
 
     with st.sidebar:
-        st.subheader("Healthy Data Source")
-        bundled_trial_paths = get_bundled_trial_paths()
-        bundled_paths_available = all(os.path.isdir(p) for p in bundled_trial_paths)
-        healthy_input_mode = st.radio(
-            "How should healthy reference data be provided?",
-            options=["Bundled trial folders (repo)", "Upload healthy DICOM files", "Local folder paths"],
-            index=(0 if bundled_paths_available else 1),
+        st.subheader("Healthy Reference (Optional)")
+        healthy_paths_raw = st.text_area(
+            "Healthy folders (one per line)",
+            value="",
+            height=110,
+            help="Leave blank to run AFTER in model-only mode. Provide paths only if you want BEFORE and/or healthy-diff scoring.",
         )
-
-        before_paths_raw = ""
-        after_paths_raw = ""
-        if healthy_input_mode == "Bundled trial folders (repo)":
-            st.subheader("Bundled Healthy Paths")
-            st.code("\n".join(bundled_trial_paths), language="text")
-            if bundled_paths_available:
-                st.caption("Bundled trial folders found. No healthy upload required.")
-            else:
-                st.warning("Bundled trial folders are missing. Add them to the repo or choose another input mode.")
-        elif healthy_input_mode == "Local folder paths":
-            st.subheader("Healthy Paths")
-            before_paths_raw = st.text_area(
-                "BEFORE healthy folders (one per line)",
-                value="/path/to/trial1\n/path/to/trial2\n/path/to/trial3",
-                height=110,
-            )
-            after_paths_raw = st.text_area(
-                "AFTER healthy folders (one per line)",
-                value="/path/to/trial1\n/path/to/trial2\n/path/to/trial3",
-                height=110,
-            )
-        else:
-            st.caption("Use the Run tab to upload healthy trial files for trial1/trial2/trial3.")
+        run_before_pipeline = st.checkbox(
+            "Run BEFORE pipeline (requires healthy folders)",
+            value=False,
+        )
 
         st.subheader("Run Settings")
         output_root = st.text_input("Output root", value="outputs")
@@ -1015,7 +993,7 @@ def main() -> None:
             else:
                 try:
                     payload = parse_saved_payload(saved_payload_file)
-                    before_saved = payload["before"]
+                    before_saved = payload.get("before")
                     after_saved = payload["after"]
                     render_comparison_outputs(before_saved, after_saved)
                 except Exception as e:
@@ -1027,57 +1005,7 @@ def main() -> None:
             accept_multiple_files=True,
             key="cancer_uploads",
         )
-
-        before_trial_uploads = []
-        after_trial_uploads = []
-        reuse_before_for_after = True
-        if healthy_input_mode == "Upload healthy DICOM files":
-            st.markdown("#### Upload Healthy Reference Trials")
-            st.caption("Upload each trial as DICOM files and/or a ZIP archive.")
-            before_trial_uploads = [
-                st.file_uploader(
-                    "BEFORE trial1",
-                    accept_multiple_files=True,
-                    key="before_trial1_uploads",
-                ),
-                st.file_uploader(
-                    "BEFORE trial2",
-                    accept_multiple_files=True,
-                    key="before_trial2_uploads",
-                ),
-                st.file_uploader(
-                    "BEFORE trial3",
-                    accept_multiple_files=True,
-                    key="before_trial3_uploads",
-                ),
-            ]
-            reuse_before_for_after = st.checkbox(
-                "Use the same healthy uploads for AFTER",
-                value=True,
-                key="reuse_before_uploads_for_after",
-            )
-            if not reuse_before_for_after:
-                after_trial_uploads = [
-                    st.file_uploader(
-                        "AFTER trial1",
-                        accept_multiple_files=True,
-                        key="after_trial1_uploads",
-                    ),
-                    st.file_uploader(
-                        "AFTER trial2",
-                        accept_multiple_files=True,
-                        key="after_trial2_uploads",
-                    ),
-                    st.file_uploader(
-                        "AFTER trial3",
-                        accept_multiple_files=True,
-                        key="after_trial3_uploads",
-                    ),
-                ]
-        elif healthy_input_mode == "Local folder paths":
-            st.caption("Using local healthy paths configured in the sidebar.")
-        else:
-            st.caption("Using bundled healthy trial folders from the repository.")
+        st.caption("Healthy trial uploads are not required. This run will use your cached AFTER model.")
 
         if not run_btn:
             st.info("Set paths and upload files, then click Run Comparison.")
@@ -1088,6 +1016,18 @@ def main() -> None:
             return
 
         seed_everything(42)
+
+        healthy_paths = parse_paths(healthy_paths_raw)
+        if healthy_paths:
+            try:
+                validate_healthy_paths(healthy_paths, "HEALTHY")
+            except Exception as e:
+                st.error(str(e))
+                return
+        if run_before_pipeline and not healthy_paths:
+            st.error("BEFORE pipeline requires healthy folders. Add healthy paths in the sidebar.")
+            return
+
         allow_after_training = not reuse_cached_model_only
         abs_model_path = os.path.abspath(model_path) if model_path else ""
         if reuse_cached_model_only and (not abs_model_path or not os.path.exists(abs_model_path)):
@@ -1103,35 +1043,7 @@ def main() -> None:
         after_dir = os.path.join(run_dir, "after")
         upload_dir = os.path.join(run_dir, "uploaded_cancer")
         os.makedirs(run_dir, exist_ok=True)
-
-        before_paths: List[str] = []
-        after_paths: List[str] = []
-
-        if healthy_input_mode == "Local folder paths":
-            before_paths = parse_paths(before_paths_raw)
-            after_paths = parse_paths(after_paths_raw)
-            try:
-                validate_healthy_paths(before_paths, "BEFORE")
-                validate_healthy_paths(after_paths, "AFTER")
-            except Exception as e:
-                st.error(str(e))
-                return
-        elif healthy_input_mode == "Bundled trial folders (repo)":
-            before_paths = get_bundled_trial_paths()
-            after_paths = before_paths.copy()
-            try:
-                validate_healthy_paths(before_paths, "BEFORE")
-                validate_healthy_paths(after_paths, "AFTER")
-            except Exception as e:
-                st.error(str(e))
-                return
-        else:
-            if any(len(files) == 0 for files in before_trial_uploads):
-                st.error("Please upload healthy files for BEFORE trial1, trial2, and trial3.")
-                return
-            if not reuse_before_for_after and any(len(files) == 0 for files in after_trial_uploads):
-                st.error("Please upload healthy files for AFTER trial1, trial2, and trial3.")
-                return
+        before = None
 
         with st.status("Running pipelines...", expanded=True) as status:
             try:
@@ -1139,39 +1051,25 @@ def main() -> None:
                 cancer_path = save_uploaded_files(uploads, upload_dir)
                 st.write(f"Cancer input folder: `{cancer_path}`")
 
-                if healthy_input_mode == "Upload healthy DICOM files":
-                    healthy_root = os.path.join(run_dir, "uploaded_healthy")
-                    before_paths = []
-                    for i, files in enumerate(before_trial_uploads, start=1):
-                        st.write(f"Saving BEFORE trial{i} uploads...")
-                        trial_dir = os.path.join(healthy_root, "before", f"trial{i}")
-                        before_paths.append(save_uploaded_files(files, trial_dir))
-
-                    if reuse_before_for_after:
-                        after_paths = before_paths.copy()
-                    else:
-                        after_paths = []
-                        for i, files in enumerate(after_trial_uploads, start=1):
-                            st.write(f"Saving AFTER trial{i} uploads...")
-                            trial_dir = os.path.join(healthy_root, "after", f"trial{i}")
-                            after_paths.append(save_uploaded_files(files, trial_dir))
-
-                st.write("Running BEFORE...")
-                before = run_before(
-                    cancer_path=cancer_path,
-                    healthy_paths=before_paths,
-                    out_dir=before_dir,
-                    make_gif=make_gif,
-                    fps=int(fps),
-                    frame_stride=int(frame_stride),
-                    max_gif_frames=int(max_gif_frames),
-                    max_slices=int(max_slices),
-                )
+                if run_before_pipeline:
+                    st.write("Running BEFORE...")
+                    before = run_before(
+                        cancer_path=cancer_path,
+                        healthy_paths=healthy_paths,
+                        out_dir=before_dir,
+                        make_gif=make_gif,
+                        fps=int(fps),
+                        frame_stride=int(frame_stride),
+                        max_gif_frames=int(max_gif_frames),
+                        max_slices=int(max_slices),
+                    )
+                else:
+                    st.write("Skipping BEFORE (disabled).")
 
                 st.write("Running AFTER...")
                 after = run_after(
                     cancer_path=cancer_path,
-                    healthy_paths=after_paths,
+                    healthy_paths=healthy_paths,
                     out_dir=after_dir,
                     model_path=model_path,
                     force_retrain_model=force_retrain,
@@ -1197,9 +1095,8 @@ def main() -> None:
             "run_id": run_id,
             "timestamp_utc": datetime.utcnow().isoformat() + "Z",
             "cancer_path": cancer_path,
-            "healthy_input_mode": healthy_input_mode,
-            "before_healthy_paths": before_paths,
-            "after_healthy_paths": after_paths,
+            "healthy_paths": healthy_paths,
+            "run_before_pipeline": bool(run_before_pipeline),
             "run_settings": {
                 "make_gif": bool(make_gif),
                 "fps": int(fps),
