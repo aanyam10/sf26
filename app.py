@@ -679,7 +679,19 @@ def max_lung_width_px(mask3d: np.ndarray) -> int:
 @st.cache_resource(show_spinner=False)
 def load_model_cached(path: str):
     tf = get_tf()
-    return tf.keras.models.load_model(path, compile=False)
+    try:
+        return tf.keras.models.load_model(path, compile=False)
+    except Exception as load_err:
+        # Cross-environment fallback: rebuild known architecture and load only weights.
+        try:
+            model = build_ae((160, 160, 1), 1e-3)
+            model.load_weights(path)
+            return model
+        except Exception as weights_err:
+            raise RuntimeError(
+                "Failed to load cached model. This is usually a TensorFlow/Keras version mismatch "
+                f"for `{path}`. Original error: {load_err}"
+            ) from weights_err
 
 
 def load_or_train_after_model(
