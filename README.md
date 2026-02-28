@@ -1,15 +1,20 @@
-# Cancer DICOM Before/After GIF App (Streamlit)
+# Colab-Equivalent Before/After DICOM App (Streamlit)
 
-This app uses one cached model file only:
+This Streamlit app is rewritten to follow the same pipeline style as your Colab code:
 
-- `model_cache/after_ae_model.keras`
+- `before` pipeline using healthy references
+- `after` pipeline using healthy references + AE + neurosymbolic cleanup
+- laser treatment simulation with GIF output
 
-You upload one cancer DICOM case (files or zip), and the app generates:
+## Folder layout required
 
-- `before_treatment.gif`
-- `after_treatment.gif`
+Place healthy reference DICOM folders in the repo:
 
-No healthy trial uploads are required.
+- `data/trial1`
+- `data/trial2`
+- `data/trial3`
+
+You upload only the cancer case in the UI.
 
 ## Quick start
 
@@ -21,26 +26,20 @@ python -m pip install -r requirements.txt
 python -m streamlit run app.py
 ```
 
-## Required model file
-
-Place your model at:
-
-- `model_cache/after_ae_model.keras`
-
-If the model file is missing, the app will stop with an error.
-
 ## Usage
 
-1. Launch the app.
-2. Confirm model path is `model_cache/after_ae_model.keras`.
-3. Upload one cancer DICOM case.
-4. Click `Generate Before/After GIFs`.
-5. Download both GIF files from the UI.
+1. Ensure `data/trial1..3` contain healthy DICOM files.
+2. Launch app and keep sidebar defaults unless needed.
+3. Upload one cancer DICOM case (files or zip).
+4. Click `Run Comparison`.
+5. Download:
+   - `before_treatment.gif`
+   - `after_treatment.gif`
 
 ## Outputs
 
-Each run saves under:
+Each run writes:
 
-- `outputs/<timestamp>/before_treatment.gif`
-- `outputs/<timestamp>/after_treatment.gif`
+- `outputs/<timestamp>/before/before_treatment.gif`
+- `outputs/<timestamp>/after/after_treatment.gif`
 - `outputs/<timestamp>/model_output.json`

@@ -9,83 +9,49 @@ import shutil
 import time
 import zipfile
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple
+from typing import List, Tuple
 
+import matplotlib
 import numpy as np
 import pydicom
 import streamlit as st
-from PIL import Image, ImageDraw
+import tensorflow as tf
 from scipy import ndimage
 
 
-DEFAULT_MODEL_PATH = "model_cache/after_ae_model.keras"
-DEFAULT_BASELINE_PATH = "baseline_cache/healthy_baseline.npz"
-DEFAULT_OUTPUT_ROOT = "outputs"
+# Ensure GIF rendering works in headless environments.
+matplotlib.use("Agg")
+from matplotlib import animation, pyplot as plt
 
 
-def get_tf():
-    try:
-        import tensorflow as tf
-    except Exception as e:
-        raise RuntimeError("TensorFlow is required to load and run the model.") from e
-    return tf
+# Default to Colab-equivalent folder layout in repo.
+DEFAULT_HEALTHY_ROOT = "data"
+DEFAULT_BEFORE_PATHS = [
+    os.path.join(DEFAULT_HEALTHY_ROOT, "trial1"),
+    os.path.join(DEFAULT_HEALTHY_ROOT, "trial2"),
+    os.path.join(DEFAULT_HEALTHY_ROOT, "trial3"),
+]
+DEFAULT_AFTER_PATHS = [
+    os.path.join(DEFAULT_HEALTHY_ROOT, "trial1"),
+    os.path.join(DEFAULT_HEALTHY_ROOT, "trial2"),
+    os.path.join(DEFAULT_HEALTHY_ROOT, "trial3"),
+]
 
 
 def seed_everything(seed: int = 42) -> None:
     random.seed(seed)
     np.random.seed(seed)
-    try:
-        tf = get_tf()
-        tf.random.set_seed(seed)
-    except Exception:
-        # App can still render until model inference is requested.
-        pass
-
-
-def save_uploaded_files(uploaded_files: List[st.runtime.uploaded_file_manager.UploadedFile], dest_root: str) -> str:
-    if os.path.isdir(dest_root):
-        shutil.rmtree(dest_root)
-    os.makedirs(dest_root, exist_ok=True)
-
-    if not uploaded_files:
-        raise RuntimeError("No uploaded files received.")
-
-    for i, uf in enumerate(uploaded_files):
-        name = os.path.basename(uf.name)
-        raw = uf.getvalue()
-
-        if name.lower().endswith(".zip"):
-            with zipfile.ZipFile(io.BytesIO(raw), "r") as zf:
-                zf.extractall(dest_root)
-        else:
-            out_name = f"{i:04d}_{name}"
-            out_path = os.path.join(dest_root, out_name)
-            with open(out_path, "wb") as f:
-                f.write(raw)
-
-    best_dir = None
-    best_count = -1
-    for root, _, files in os.walk(dest_root):
-        count = sum(1 for fn in files if os.path.isfile(os.path.join(root, fn)))
-        if count > best_count:
-            best_count = count
-            best_dir = root
-
-    if best_dir is None or best_count <= 0:
-        raise RuntimeError("No readable files were found after upload extraction.")
-
-    return best_dir
+    tf.random.set_seed(seed)
 
 
 def get_sorted_dicom_files(folder: str) -> List[str]:
     if not os.path.isdir(folder):
         raise FileNotFoundError(f"Folder not found: {folder}")
-
-    files = [os.path.join(folder, f) for f in os.listdir(folder) if os.path.isfile(os.path.join(folder, f))]
-    if not files:
+    fs = [os.path.join(folder, f) for f in os.listdir(folder) if os.path.isfile(os.path.join(folder, f))]
+    if not fs:
         raise FileNotFoundError(f"No files in {folder}")
 
-    def sort_key(path: str):
+    def k(path: str):
         try:
             ds = pydicom.dcmread(path, stop_before_pixels=True, force=True)
             if hasattr(ds, "InstanceNumber"):
@@ -96,26 +62,28 @@ def get_sorted_dicom_files(folder: str) -> List[str]:
             pass
         return (2, os.path.basename(path))
 
-    return sorted(files, key=sort_key)
+    return sorted(fs, key=k)
 
 
 def read_hu(path: str) -> np.ndarray:
     ds = pydicom.dcmread(path, force=True)
     arr = ds.pixel_array.astype(np.float32)
-    slope = float(getattr(ds, "RescaleSlope", 1.0))
-    intercept = float(getattr(ds, "RescaleIntercept", 0.0))
-    return arr * slope + intercept
+    s = float(getattr(ds, "RescaleSlope", 1.0))
+    b = float(getattr(ds, "RescaleIntercept", 0.0))
+    return arr * s + b
 
 
 def get_pixel_spacing_mm(path: str) -> Tuple[float, float]:
     ds = pydicom.dcmread(path, stop_before_pixels=True, force=True)
     px = getattr(ds, "PixelSpacing", [1.0, 1.0])
     return float(px[0]), float(px[1])
+
+
 def resize_2d(img: np.ndarray, target_shape: Tuple[int, int], order: int = 1) -> np.ndarray:
     if img.shape == target_shape:
         return img
-    zoom = (target_shape[0] / img.shape[0], target_shape[1] / img.shape[1])
-    return ndimage.zoom(img, zoom=zoom, order=order)
+    z = (target_shape[0] / img.shape[0], target_shape[1] / img.shape[1])
+    return ndimage.zoom(img, zoom=z, order=order)
 
 
 def ct_window_norm(hu: np.ndarray, lo: float = -1000.0, hi: float = 400.0) -> np.ndarray:
@@ -149,108 +117,20 @@ def lung_mask_2d(ct_hu: np.ndarray) -> np.ndarray:
     return m.astype(bool)
 
 
-def robust_positive_z(arr: np.ndarray, valid: np.ndarray) -> np.ndarray:
-    vals = arr[valid] if np.any(valid) else arr.ravel()
-    med = np.median(vals)
-    mad = np.median(np.abs(vals - med)) + 1e-6
-    z = 0.6745 * (arr - med) / mad
-    return np.clip(z, 0.0, None).astype(np.float32)
-
-
-def remove_small_components_3d(mask3d: np.ndarray, min_vox: int = 40, min_span: int = 1) -> np.ndarray:
-    lab, n = ndimage.label(mask3d)
-    if n == 0:
-        return np.zeros_like(mask3d, dtype=bool)
-    keep_ids = []
-    for cid in range(1, n + 1):
-        pts = np.argwhere(lab == cid)
-        if pts.shape[0] < min_vox:
-            continue
-        zspan = int(pts[:, 0].max() - pts[:, 0].min() + 1)
-        if zspan < min_span:
-            continue
-        keep_ids.append(cid)
-    if not keep_ids:
-        return np.zeros_like(mask3d, dtype=bool)
-    return np.isin(lab, keep_ids)
-
-
-def temporal_majority_3d(mask3d: np.ndarray, min_support: int = 2) -> np.ndarray:
-    m = mask3d.astype(np.uint8)
-    acc = m.copy()
-    acc[1:] += m[:-1]
-    acc[:-1] += m[1:]
-    out = acc >= min_support
-    if out.sum() == 0 and mask3d.sum() > 0:
-        return mask3d
-    return out
-
-
-def neurosymbolic_cleanup(mask3d: np.ndarray, min_px: int = 18, min_vox: int = 40, min_span: int = 1) -> np.ndarray:
-    out = np.zeros_like(mask3d, dtype=bool)
-    for z in range(mask3d.shape[0]):
-        m = ndimage.binary_opening(mask3d[z], structure=np.ones((3, 3)))
-        m = ndimage.binary_closing(m, structure=np.ones((5, 5)))
-        out[z] = remove_small_blobs(m, min_pixels=min_px)
-    out = temporal_majority_3d(out, min_support=2)
-    out3 = remove_small_components_3d(out, min_vox=min_vox, min_span=min_span)
-    return out3 if out3.sum() > 0 else out
-
-
-def topk_fallback_3d(score3d: np.ndarray, valid3d: np.ndarray, ratio: float = 0.006, min_per_slice: int = 14) -> np.ndarray:
-    out = np.zeros_like(valid3d, dtype=bool)
-    for z in range(score3d.shape[0]):
-        valid_idx = np.flatnonzero(valid3d[z].ravel())
-        if valid_idx.size == 0:
-            continue
-        k = max(min_per_slice, int(valid_idx.size * ratio))
-        if k >= valid_idx.size:
-            chosen = valid_idx
-        else:
-            vals = score3d[z].ravel()[valid_idx]
-            chosen = valid_idx[np.argpartition(vals, -k)[-k:]]
-        out[z].ravel()[chosen] = True
-    return out
-
-
-def max_lung_width_px(mask3d: np.ndarray) -> int:
-    widths = []
-    for z in range(mask3d.shape[0]):
-        _, xs = np.where(mask3d[z])
-        if xs.size:
-            widths.append(int(xs.max() - xs.min() + 1))
-    return max(widths) if widths else 1
-
-
-def evenly_spaced_indices(total: int, limit: int) -> List[int]:
-    if limit <= 0 or total <= limit:
-        return list(range(total))
-    idx = np.linspace(0, total - 1, num=limit)
-    idx = np.round(idx).astype(int)
-    idx = np.clip(idx, 0, total - 1)
-    return list(dict.fromkeys(idx.tolist()))
-
-
-def breathing_order(n: int) -> List[int]:
-    if n <= 1:
-        return [0]
-    return list(range(n)) + list(range(n - 2, -1, -1))
-
-
-def disk_mask(shape: Tuple[int, int], cy: int, cx: int, radius: int) -> np.ndarray:
+def disk_mask(shape: Tuple[int, int], cy: int, cx: int, r: int) -> np.ndarray:
     yy, xx = np.ogrid[: shape[0], : shape[1]]
-    return (yy - cy) ** 2 + (xx - cx) ** 2 <= (radius ** 2)
+    return (yy - cy) ** 2 + (xx - cx) ** 2 <= (r**2)
 
 
-def bresenham_line(y0: int, x0: int, y1: int, x1: int) -> List[Tuple[int, int]]:
-    points = []
+def bresenham_line(y0: int, x0: int, y1: int, x1: int):
+    pts = []
     dx = abs(x1 - x0)
     sx = 1 if x0 < x1 else -1
     dy = -abs(y1 - y0)
     sy = 1 if y0 < y1 else -1
     err = dx + dy
     while True:
-        points.append((y0, x0))
+        pts.append((y0, x0))
         if x0 == x1 and y0 == y1:
             break
         e2 = 2 * err
@@ -260,20 +140,273 @@ def bresenham_line(y0: int, x0: int, y1: int, x1: int) -> List[Tuple[int, int]]:
         if e2 <= dx:
             err += dx
             y0 += sy
-    return points
+    return pts
 
 
-def nearest_active(mask: np.ndarray, yx: Tuple[int, int]) -> Optional[Tuple[int, int]]:
-    coords = np.argwhere(mask)
-    if coords.size == 0:
+def nearest_active(mask: np.ndarray, yx: Tuple[int, int]):
+    c = np.argwhere(mask)
+    if c.size == 0:
         return None
-    d2 = (coords[:, 0] - yx[0]) ** 2 + (coords[:, 1] - yx[1]) ** 2
+    d2 = (c[:, 0] - yx[0]) ** 2 + (c[:, 1] - yx[1]) ** 2
     j = int(np.argmin(d2))
-    return int(coords[j, 0]), int(coords[j, 1])
+    return int(c[j, 0]), int(c[j, 1])
 
 
-def build_ae(shape: Tuple[int, int, int] = (160, 160, 1), lr: float = 1e-3):
-    tf = get_tf()
+def breathing_order(n: int):
+    if n <= 1:
+        return [0]
+    return list(range(n)) + list(range(n - 2, -1, -1))
+
+
+def run_treatment(
+    active_global: np.ndarray,
+    px_radius: int,
+    max_steps: int = 160000,
+    make_gif: bool = False,
+    gif_path: str | None = None,
+    ct_slices_u8: List[np.ndarray] | None = None,
+    gray_masks: List[np.ndarray] | None = None,
+    fps: int = 12,
+    frame_stride: int = 6,
+    max_gif_frames: int = 900,
+    laser_off_when_idle: bool = False,
+):
+    steps, treated = 0, 0
+    initial = int(active_global.sum())
+
+    writer = fig = ax = im = dot = None
+    captured = 0
+    global_capture_step = 0
+    breath_seq = [0]
+
+    if (
+        make_gif
+        and gif_path
+        and ct_slices_u8 is not None
+        and gray_masks is not None
+        and len(ct_slices_u8) > 0
+        and len(ct_slices_u8) == len(gray_masks)
+    ):
+        breath_seq = breathing_order(len(ct_slices_u8))
+        fig, ax = plt.subplots(figsize=(6, 6))
+        ax.axis("off")
+
+        first_bg = breath_seq[0]
+        bg = ct_slices_u8[first_bg].astype(np.float32) / 255.0
+        frame = np.repeat(bg[..., None], 3, axis=2)
+        visible = active_global & gray_masks[first_bg]
+        frame[visible, 0] = 1.0
+        frame[visible, 1] = 1.0
+        frame[visible, 2] = 0.0
+
+        im = ax.imshow(frame, interpolation="nearest")
+        dot = plt.Circle((0, 0), radius=px_radius, edgecolor="red", fill=False, linewidth=2)
+        dot.set_visible(False)
+        ax.add_patch(dot)
+
+        writer = animation.PillowWriter(fps=fps)
+        writer.setup(fig, gif_path, dpi=90)
+        writer.grab_frame()
+        captured = 1
+
+        def draw(background_idx, show_dot=False, laser_pos=(0, 0), laser_color="red"):
+            bg0 = ct_slices_u8[background_idx].astype(np.float32) / 255.0
+            rgb = np.repeat(bg0[..., None], 3, axis=2)
+            visible_overlay = active_global & gray_masks[background_idx]
+            rgb[visible_overlay, 0] = 1.0
+            rgb[visible_overlay, 1] = 1.0
+            rgb[visible_overlay, 2] = 0.0
+            im.set_data(rgb)
+
+            if show_dot:
+                py, px = laser_pos
+                dot.center = (px, py)
+                dot.set_edgecolor(laser_color)
+                dot.set_visible(True)
+            else:
+                dot.set_visible(False)
+
+    if initial > 0:
+        c = np.argwhere(active_global)
+        y, x = np.mean(c, axis=0).astype(int)
+    else:
+        y, x = active_global.shape[0] // 2, active_global.shape[1] // 2
+
+    while active_global.any() and steps < max_steps:
+        t = nearest_active(active_global, (y, x))
+        if t is None:
+            break
+        ty, tx = t
+        for py, px in bresenham_line(y, x, ty, tx):
+            steps += 1
+            hit = active_global & disk_mask(active_global.shape, py, px, px_radius)
+            laser_on = np.any(hit)
+            if np.any(hit):
+                n = int(hit.sum())
+                active_global[hit] = False
+                treated += n
+
+            if writer is not None and (steps % frame_stride == 0) and (captured < max_gif_frames):
+                bg_idx = breath_seq[global_capture_step % len(breath_seq)]
+                if laser_off_when_idle and not laser_on:
+                    draw(bg_idx, show_dot=False)
+                else:
+                    draw(
+                        bg_idx,
+                        show_dot=True,
+                        laser_pos=(py, px),
+                        laser_color=("red" if laser_on else "blue"),
+                    )
+                writer.grab_frame()
+                captured += 1
+                global_capture_step += 1
+
+            if not active_global.any() or steps >= max_steps:
+                break
+        y, x = ty, tx
+
+    if writer is not None:
+        if captured < max_gif_frames:
+            bg_idx = breath_seq[global_capture_step % len(breath_seq)]
+            draw(
+                bg_idx,
+                show_dot=False if laser_off_when_idle else True,
+                laser_pos=(y, x),
+                laser_color="red",
+            )
+            writer.grab_frame()
+        writer.finish()
+        plt.close(fig)
+
+    remaining = int(active_global.sum())
+    removed = (100.0 * treated / initial) if initial > 0 else 0.0
+    return initial, treated, remaining, removed, steps
+
+
+def save_csv(path: str, counts: np.ndarray, col: str):
+    import csv
+
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["slice_index", col])
+        for i, c in enumerate(counts.tolist()):
+            w.writerow([i, int(c)])
+
+
+def detect_lesion_before(c_hu, healthy_hus, zthr=2.5, gray_min=0.10, gray_max=0.85, min_px=40):
+    c_n = ct_window_norm(c_hu)
+    h_n = [ct_window_norm(h) for h in healthy_hus]
+    base = np.median(np.stack(h_n, axis=0), axis=0)
+    diff = c_n - base
+    med = np.median(diff)
+    mad = np.median(np.abs(diff - med)) + 1e-6
+    z = 0.6745 * (diff - med) / mad
+    lesion = (z > zthr) & lung_mask_2d(c_hu) & (c_n >= gray_min) & (c_n <= gray_max)
+    lesion = ndimage.binary_opening(lesion, structure=np.ones((3, 3)))
+    lesion = ndimage.binary_closing(lesion, structure=np.ones((5, 5)))
+    return remove_small_blobs(lesion, min_px).astype(bool)
+
+
+def run_before(cancer_path, healthy_paths, out_dir, make_gif=True, fps=12, frame_stride=6, max_gif_frames=900):
+    os.makedirs(out_dir, exist_ok=True)
+    t0 = time.time()
+    hf = [get_sorted_dicom_files(p) for p in healthy_paths]
+    cf = get_sorted_dicom_files(cancer_path)
+    n = min([len(cf)] + [len(x) for x in hf])
+    hf, cf = [x[:n] for x in hf], cf[:n]
+    y_mm, x_mm = get_pixel_spacing_mm(cf[0])
+    px_radius = max(1, int(round(2.5 / ((y_mm + x_mm) / 2.0))))
+
+    lesions, grays, ct_slices_u8 = [], [], []
+    counts = np.zeros(n, dtype=np.int32)
+    ref = None
+    for i in range(n):
+        c = read_hu(cf[i])
+        ref = c.shape if ref is None else ref
+        c = resize_2d(c, ref, 1)
+        c_n = ct_window_norm(c)
+        hs = [resize_2d(read_hu(x[i]), ref, 1) for x in hf]
+        l = detect_lesion_before(c, hs)
+        g = (c_n >= 0.10) & (c_n <= 0.85)
+        l = l & g
+        lesions.append(l)
+        grays.append(g)
+        counts[i] = int(l.sum())
+        ct_slices_u8.append((c_n * 255.0).astype(np.uint8))
+        if (i + 1) % 20 == 0:
+            gc.collect()
+
+    active, gray_union = np.zeros(ref, bool), np.zeros(ref, bool)
+    for l, g in zip(lesions, grays):
+        active |= l
+        gray_union |= g
+    active &= gray_union
+    active = remove_small_blobs(active, 40)
+
+    gif_path = os.path.join(out_dir, "before_treatment.gif")
+    init, treated, rem, pct, steps = run_treatment(
+        active,
+        px_radius,
+        160000,
+        make_gif=make_gif,
+        gif_path=gif_path,
+        ct_slices_u8=ct_slices_u8,
+        gray_masks=grays,
+        fps=fps,
+        frame_stride=frame_stride,
+        max_gif_frames=max_gif_frames,
+        laser_off_when_idle=False,
+    )
+
+    csv_path = os.path.join(out_dir, "slice_detected_counts.csv")
+    save_csv(csv_path, counts, "detected_pixels_gray_only")
+    summary = {
+        "initial_total_cancer_pixels": init,
+        "treated_total_pixels": treated,
+        "remaining_total_pixels": rem,
+        "percent_removed": round(pct, 2),
+        "laser_steps": steps,
+        "runtime_seconds": round(time.time() - t0, 2),
+        "csv_path": csv_path,
+        "gif_path": gif_path,
+    }
+    return summary
+
+
+def remove_small_components_3d(mask3d, min_vox=40, min_span=1):
+    lab, n = ndimage.label(mask3d)
+    if n == 0:
+        return np.zeros_like(mask3d, bool)
+    keep = []
+    for cid in range(1, n + 1):
+        pts = np.argwhere(lab == cid)
+        if pts.shape[0] < min_vox:
+            continue
+        zspan = int(pts[:, 0].max() - pts[:, 0].min() + 1)
+        if zspan < min_span:
+            continue
+        keep.append(cid)
+    return np.isin(lab, keep) if keep else np.zeros_like(mask3d, bool)
+
+
+def temporal_majority_3d(mask3d, min_support=2):
+    m = mask3d.astype(np.uint8)
+    acc = m.copy()
+    acc[1:] += m[:-1]
+    acc[:-1] += m[1:]
+    out = acc >= min_support
+    return mask3d if (out.sum() == 0 and mask3d.sum() > 0) else out
+
+
+def robust_positive_z(arr, valid):
+    vals = arr[valid] if np.any(valid) else arr.ravel()
+    med = np.median(vals)
+    mad = np.median(np.abs(vals - med)) + 1e-6
+    z = 0.6745 * (arr - med) / mad
+    return np.clip(z, 0.0, None).astype(np.float32)
+
+
+def build_ae(shape=(160, 160, 1), lr=1e-3):
     i = tf.keras.layers.Input(shape=shape)
     x = tf.keras.layers.Conv2D(16, 3, strides=2, padding="same", activation="relu")(i)
     x = tf.keras.layers.Conv2D(32, 3, strides=2, padding="same", activation="relu")(x)
@@ -286,152 +419,116 @@ def build_ae(shape: Tuple[int, int, int] = (160, 160, 1), lr: float = 1e-3):
     return m
 
 
-@st.cache_resource(show_spinner=False)
-def load_model_cached(path: str):
-    tf = get_tf()
-    try:
-        return tf.keras.models.load_model(path, compile=False)
-    except Exception as load_err:
-        try:
-            model = build_ae((160, 160, 1), 1e-3)
-            model.load_weights(path)
-            return model
-        except Exception as weights_err:
-            raise RuntimeError(
-                f"Failed to load model from `{path}`. Original load error: {load_err}"
-            ) from weights_err
+def neurosymbolic_cleanup(mask3d, min_px=18, min_vox=40, min_span=1):
+    out = np.zeros_like(mask3d, bool)
+    for z in range(mask3d.shape[0]):
+        m = ndimage.binary_opening(mask3d[z], structure=np.ones((3, 3)))
+        m = ndimage.binary_closing(m, structure=np.ones((5, 5)))
+        out[z] = remove_small_blobs(m, min_px)
+    out = temporal_majority_3d(out, 2)
+    out3 = remove_small_components_3d(out, min_vox, min_span)
+    return out3 if out3.sum() > 0 else out
 
 
-@st.cache_data(show_spinner=False)
-def load_baseline_cached(path: str) -> np.ndarray:
-    data = np.load(path)
-    if "baseline" not in data:
-        raise RuntimeError(f"`{path}` must contain key `baseline`.")
-    baseline = data["baseline"].astype(np.float32)
-    if baseline.ndim != 3:
-        raise RuntimeError(f"`baseline` in `{path}` must be 3D: (slices, H, W).")
-    return baseline
+def topk_fallback_3d(score3d, valid3d, ratio=0.006, min_per_slice=14):
+    out = np.zeros_like(valid3d, bool)
+    for z in range(score3d.shape[0]):
+        vi = np.flatnonzero(valid3d[z].ravel())
+        if vi.size == 0:
+            continue
+        k = max(min_per_slice, int(vi.size * ratio))
+        if k >= vi.size:
+            chosen = vi
+        else:
+            vals = score3d[z].ravel()[vi]
+            chosen = vi[np.argpartition(vals, -k)[-k:]]
+        out[z].ravel()[chosen] = True
+    return out
 
 
-def prepare_baseline_for_case(
-    baseline_3d: np.ndarray,
-    target_shape: Tuple[int, int],
-    target_slices: int,
-) -> np.ndarray:
-    if baseline_3d.shape[1:] != target_shape:
-        resized = np.stack([resize_2d(s, target_shape, order=1) for s in baseline_3d], axis=0).astype(np.float32)
-    else:
-        resized = baseline_3d
-
-    if resized.shape[0] == target_slices:
-        return resized
-
-    idx = np.linspace(0, resized.shape[0] - 1, num=target_slices)
-    idx = np.round(idx).astype(int)
-    idx = np.clip(idx, 0, resized.shape[0] - 1)
-    return resized[idx]
+def max_lung_width_px(mask3d):
+    w = []
+    for z in range(mask3d.shape[0]):
+        _, xs = np.where(mask3d[z])
+        if xs.size:
+            w.append(int(xs.max() - xs.min() + 1))
+    return max(w) if w else 1
 
 
-def prepare_cancer_case(cancer_dir: str, max_slices: int) -> Dict[str, object]:
-    dicom_files = get_sorted_dicom_files(cancer_dir)
-    if not dicom_files:
-        raise RuntimeError("No DICOM files found in upload.")
+def run_after(cancer_path, healthy_paths, out_dir, make_gif=True, fps=12, frame_stride=6, max_gif_frames=900):
+    os.makedirs(out_dir, exist_ok=True)
+    t0 = time.time()
+    hf = [get_sorted_dicom_files(p) for p in healthy_paths]
+    cf = get_sorted_dicom_files(cancer_path)
+    n = min([len(cf)] + [len(x) for x in hf])
+    hf, cf = [x[:n] for x in hf], cf[:n]
 
-    selected = evenly_spaced_indices(len(dicom_files), max_slices)
-    dicom_files = [dicom_files[i] for i in selected]
+    gray_masks, lung_masks, valid_masks, diff_scores = [], [], [], []
+    ct_slices_u8 = []
+    healthy_ae, cancer_ae = [], []
+    counts = np.zeros(n, dtype=np.int32)
+    ref = None
+    ae_hw = (160, 160)
 
-    hu_slices: List[np.ndarray] = []
-    norm_slices: List[np.ndarray] = []
-    u8_slices: List[np.ndarray] = []
-    gray_masks: List[np.ndarray] = []
-    lung_masks: List[np.ndarray] = []
-    valid_masks: List[np.ndarray] = []
-
-    ref_shape = None
-    for i, f in enumerate(dicom_files):
-        hu = read_hu(f)
-        if ref_shape is None:
-            ref_shape = hu.shape
-        hu = resize_2d(hu, ref_shape, order=1)
-
-        norm = ct_window_norm(hu)
-        gray = (norm >= 0.10) & (norm <= 0.85)
-        lung = lung_mask_2d(hu)
-        valid = lung & gray
+    for i in range(n):
+        c = read_hu(cf[i])
+        ref = c.shape if ref is None else ref
+        c = resize_2d(c, ref, 1)
+        c_n = ct_window_norm(c)
+        ct_slices_u8.append((c_n * 255.0).astype(np.uint8))
+        h_norms = []
+        for x in hf:
+            h = resize_2d(read_hu(x[i]), ref, 1)
+            hn = ct_window_norm(h)
+            h_norms.append(hn)
+            healthy_ae.append(resize_2d(hn, ae_hw, 1))
+        base = np.median(np.stack(h_norms, axis=0), axis=0)
+        diff = np.abs(c_n - base)
+        lmask = lung_mask_2d(c)
+        gmask = (c_n >= 0.10) & (c_n <= 0.85)
+        valid = lmask & gmask
         if valid.sum() < 50:
-            valid = lung
+            valid = lmask
         if valid.sum() < 50:
-            valid = gray
+            valid = gmask
         if valid.sum() < 50:
-            valid = np.ones_like(gray, dtype=bool)
-
-        hu_slices.append(hu)
-        norm_slices.append(norm)
-        u8_slices.append((norm * 255.0).astype(np.uint8))
-        gray_masks.append(gray)
-        lung_masks.append(lung)
+            valid = np.ones_like(gmask, bool)
+        gray_masks.append(gmask)
+        lung_masks.append(lmask)
         valid_masks.append(valid)
-
-        if (i + 1) % 25 == 0:
+        diff_scores.append(diff)
+        cancer_ae.append(resize_2d(c_n, ae_hw, 1))
+        if (i + 1) % 20 == 0:
             gc.collect()
 
-    return {
-        "dicom_files": dicom_files,
-        "hu_slices": hu_slices,
-        "norm_slices": norm_slices,
-        "u8_slices": u8_slices,
-        "gray_masks": gray_masks,
-        "lung_masks": lung_masks,
-        "valid_masks": valid_masks,
-    }
-
-
-def detect_lesions_with_model(
-    model,
-    norm_slices: List[np.ndarray],
-    valid_masks: List[np.ndarray],
-    baseline_slices: Optional[np.ndarray] = None,
-    baseline_weight: float = 0.85,
-    min_pixels: int = 18,
-) -> List[np.ndarray]:
-    if not norm_slices:
-        return []
-
-    input_shape = model.input_shape
-    if isinstance(input_shape, list):
-        input_shape = input_shape[0]
-
-    ae_h = int(input_shape[1]) if input_shape[1] else 160
-    ae_w = int(input_shape[2]) if input_shape[2] else 160
-    ae_hw = (ae_h, ae_w)
-
-    x = np.stack([resize_2d(s, ae_hw, order=1) for s in norm_slices], axis=0).astype(np.float32)[..., None]
-    pred = model.predict(x, batch_size=8, verbose=0)
-    err_small = np.abs(x - pred)[..., 0]
-
-    ae_err_3d = np.stack(
-        [resize_2d(err_small[i], norm_slices[i].shape, order=1) for i in range(len(norm_slices))],
-        axis=0,
-    ).astype(np.float32)
+    diff_3d = np.stack(diff_scores, axis=0).astype(np.float32)
     valid_3d = np.stack(valid_masks, axis=0).astype(bool)
+    ae_err = np.zeros_like(diff_3d, dtype=np.float32)
 
-    if baseline_slices is not None:
-        diff_3d = np.abs(np.stack(norm_slices, axis=0).astype(np.float32) - baseline_slices.astype(np.float32))
-    else:
-        diff_3d = np.zeros_like(ae_err_3d, dtype=np.float32)
+    if healthy_ae:
+        x_train = np.stack(healthy_ae, axis=0).astype(np.float32)
+        if x_train.shape[0] > 1200:
+            idx = np.random.choice(x_train.shape[0], 1200, replace=False)
+            x_train = x_train[idx]
+        x_train = x_train[..., None]
+        x_cancer = np.stack(cancer_ae, axis=0).astype(np.float32)[..., None]
+        tf.keras.backend.clear_session()
+        ae = build_ae((ae_hw[0], ae_hw[1], 1), 1e-3)
+        es = tf.keras.callbacks.EarlyStopping(monitor="loss", patience=2, restore_best_weights=True)
+        ae.fit(x_train, x_train, epochs=8, batch_size=8, shuffle=True, verbose=0, callbacks=[es])
+        pred = ae.predict(x_cancer, batch_size=8, verbose=0)
+        err_small = np.abs(x_cancer - pred)[..., 0]
+        for z in range(n):
+            ae_err[z] = resize_2d(err_small[z], ref, 1)
 
-    diff_z = np.zeros_like(diff_3d, dtype=np.float32)
-    ae_z = np.zeros_like(ae_err_3d, dtype=np.float32)
-    for z in range(ae_err_3d.shape[0]):
+    diff_z = np.zeros_like(diff_3d, np.float32)
+    ae_z = np.zeros_like(ae_err, np.float32)
+    for z in range(n):
         diff_z[z] = robust_positive_z(diff_3d[z], valid_3d[z])
-        ae_z[z] = robust_positive_z(ae_err_3d[z], valid_3d[z])
+        ae_z[z] = robust_positive_z(ae_err[z], valid_3d[z])
+    score = 0.85 * diff_z + 0.15 * ae_z
 
-    if baseline_slices is not None:
-        score = float(baseline_weight) * diff_z + (1.0 - float(baseline_weight)) * ae_z
-    else:
-        score = ae_z
-
-    lesion_3d = None
+    lesion_3d, used_pct = None, None
     vals = score[valid_3d] if np.any(valid_3d) else score.ravel()
     for p in [99.2, 98.8, 98.3, 97.8, 97.2, 96.5]:
         hi = float(np.percentile(vals, p))
@@ -440,164 +537,95 @@ def detect_lesions_with_model(
         cand = seed.copy()
         for _ in range(2):
             cand |= ndimage.binary_dilation(cand, structure=np.ones((1, 3, 3))) & (score > lo) & valid_3d
-        cand = neurosymbolic_cleanup(cand, min_px=min_pixels, min_vox=40, min_span=1)
+        cand = neurosymbolic_cleanup(cand, 18, 40, 1)
         if int(cand.sum()) >= 40:
-            lesion_3d = cand
+            lesion_3d, used_pct = cand, p
             break
-
     if lesion_3d is None:
-        lesion_3d = neurosymbolic_cleanup(
-            topk_fallback_3d(score, valid_3d, ratio=0.006, min_per_slice=14),
-            min_px=min_pixels,
-            min_vox=40,
-            min_span=1,
-        )
+        lesion_3d = neurosymbolic_cleanup(topk_fallback_3d(score, valid_3d, 0.006, 14), 18, 40, 1)
+        used_pct = -1.0
 
-    lesions = [lesion_3d[z].astype(bool) for z in range(lesion_3d.shape[0])]
-    for z in range(len(lesions)):
+    lesions = [lesion_3d[z].astype(bool) for z in range(n)]
+    for z in range(n):
         lesions[z] = ndimage.binary_dilation(lesions[z], structure=np.ones((3, 3))) & valid_masks[z]
-    return lesions
+        counts[z] = int(lesions[z].sum())
 
+    active, gray_union = np.zeros(ref, bool), np.zeros(ref, bool)
+    for l, g in zip(lesions, gray_masks):
+        active |= l
+        gray_union |= g
+    active &= gray_union
+    active = remove_small_blobs(active, 18)
 
-def save_gif(frames: List[Image.Image], out_path: str, fps: int) -> None:
-    if not frames:
-        raise RuntimeError("No frames available to save GIF.")
-    duration_ms = max(20, int(round(1000 / max(1, fps))))
-    frames[0].save(
-        out_path,
-        save_all=True,
-        append_images=frames[1:],
-        optimize=False,
-        duration=duration_ms,
-        loop=0,
+    lung3d = np.stack(lung_masks, axis=0).astype(bool)
+    px_per_mm = max_lung_width_px(lung3d) / 300.0
+    px_radius = max(1, int(round((5.0 / 2.0) * px_per_mm)))
+
+    gif_path = os.path.join(out_dir, "after_treatment.gif")
+    init, treated, rem, pct, steps = run_treatment(
+        active,
+        px_radius,
+        160000,
+        make_gif=make_gif,
+        gif_path=gif_path,
+        ct_slices_u8=ct_slices_u8,
+        gray_masks=gray_masks,
+        fps=fps,
+        frame_stride=frame_stride,
+        max_gif_frames=max_gif_frames,
+        laser_off_when_idle=True,
     )
 
-
-def make_before_gif(
-    u8_slices: List[np.ndarray],
-    active_global: np.ndarray,
-    gray_masks: List[np.ndarray],
-    out_path: str,
-    fps: int,
-    max_frames: int,
-) -> None:
-    order = breathing_order(len(u8_slices))
-    if len(order) > max_frames:
-        selected = evenly_spaced_indices(len(order), max_frames)
-        order = [order[i] for i in selected]
-
-    frames: List[Image.Image] = []
-    for idx in order:
-        bg = u8_slices[idx]
-        rgb = np.repeat(bg[..., None], 3, axis=2)
-        m = active_global & gray_masks[idx]
-        rgb[m, 0] = 255
-        rgb[m, 1] = 255
-        rgb[m, 2] = 0
-        frames.append(Image.fromarray(rgb))
-
-    save_gif(frames, out_path, fps=fps)
-
-
-def build_active_map(lesions: List[np.ndarray], gray_masks: List[np.ndarray], min_pixels: int = 18) -> np.ndarray:
-    if not lesions:
-        raise RuntimeError("Lesion masks are empty.")
-
-    ref_shape = lesions[0].shape
-    active = np.zeros(ref_shape, dtype=bool)
-    gray_union = np.zeros(ref_shape, dtype=bool)
-    for lesion, gray in zip(lesions, gray_masks):
-        active |= lesion
-        gray_union |= gray
-    active &= gray_union
-    return remove_small_blobs(active, min_pixels=min_pixels).astype(bool)
-
-
-def run_treatment_and_make_after_gif(
-    active_global: np.ndarray,
-    u8_slices: List[np.ndarray],
-    gray_masks: List[np.ndarray],
-    out_path: str,
-    px_radius: int,
-    fps: int,
-    frame_stride: int,
-    max_frames: int,
-    max_steps: int = 160000,
-) -> Dict[str, int]:
-    active = active_global.copy()
-    initial = int(active.sum())
-    treated = 0
-    steps = 0
-
-    breath_seq = breathing_order(len(u8_slices))
-    capture_step = 0
-    frames: List[Image.Image] = []
-
-    def capture(show_dot: bool = False, pos: Tuple[int, int] = (0, 0), color: Tuple[int, int, int] = (255, 0, 0)):
-        nonlocal capture_step
-        bg_idx = breath_seq[capture_step % len(breath_seq)]
-        bg = u8_slices[bg_idx]
-        rgb = np.repeat(bg[..., None], 3, axis=2)
-        visible = active & gray_masks[bg_idx]
-        rgb[visible, 0] = 255
-        rgb[visible, 1] = 255
-        rgb[visible, 2] = 0
-        img = Image.fromarray(rgb)
-        if show_dot:
-            py, px = pos
-            draw = ImageDraw.Draw(img)
-            r = px_radius
-            draw.ellipse((px - r, py - r, px + r, py + r), outline=color, width=2)
-        frames.append(img)
-        capture_step += 1
-
-    capture(show_dot=False)
-
-    if initial > 0:
-        coords = np.argwhere(active)
-        y, x = np.mean(coords, axis=0).astype(int)
-    else:
-        y, x = active.shape[0] // 2, active.shape[1] // 2
-
-    while active.any() and steps < max_steps and len(frames) < max_frames:
-        target = nearest_active(active, (y, x))
-        if target is None:
-            break
-        ty, tx = target
-
-        for py, px in bresenham_line(y, x, ty, tx):
-            steps += 1
-            hit = active & disk_mask(active.shape, py, px, px_radius)
-            laser_on = bool(np.any(hit))
-
-            if laser_on:
-                n = int(hit.sum())
-                active[hit] = False
-                treated += n
-
-            if (steps % frame_stride == 0) and (len(frames) < max_frames):
-                capture(
-                    show_dot=True,
-                    pos=(py, px),
-                    color=((255, 0, 0) if laser_on else (0, 0, 255)),
-                )
-
-            if not active.any() or steps >= max_steps or len(frames) >= max_frames:
-                break
-
-        y, x = ty, tx
-
-    if len(frames) < max_frames:
-        capture(show_dot=False)
-
-    save_gif(frames, out_path, fps=fps)
-    remaining = int(active.sum())
-    return {
-        "initial_pixels": initial,
-        "treated_pixels": treated,
-        "remaining_pixels": remaining,
+    csv_path = os.path.join(out_dir, "slice_detected_counts.csv")
+    save_csv(csv_path, counts, "detected_pixels_gray_lung_ai")
+    summary = {
+        "initial_total_cancer_pixels": init,
+        "treated_total_pixels": treated,
+        "remaining_total_pixels": rem,
+        "percent_removed": round(pct, 2),
         "laser_steps": steps,
+        "detection_percentile_used": used_pct,
+        "beam_radius_px": px_radius,
+        "runtime_seconds": round(time.time() - t0, 2),
+        "csv_path": csv_path,
+        "gif_path": gif_path,
     }
+    return summary
+
+
+def save_uploaded_cancer_folder(uploaded_files: List[st.runtime.uploaded_file_manager.UploadedFile], dest_root: str) -> str:
+    if os.path.isdir(dest_root):
+        shutil.rmtree(dest_root)
+    os.makedirs(dest_root, exist_ok=True)
+
+    if not uploaded_files:
+        raise RuntimeError("No files uploaded.")
+
+    for i, uf in enumerate(uploaded_files):
+        name = os.path.basename(uf.name)
+        data = uf.getvalue()
+        if name.lower().endswith(".zip"):
+            with zipfile.ZipFile(io.BytesIO(data), "r") as zf:
+                zf.extractall(dest_root)
+        else:
+            with open(os.path.join(dest_root, f"{i:04d}_{name}"), "wb") as f:
+                f.write(data)
+
+    best, best_n = None, -1
+    for root, _, fs in os.walk(dest_root):
+        n = sum(1 for fn in fs if os.path.isfile(os.path.join(root, fn)))
+        if n > best_n:
+            best, best_n = root, n
+    if best is None or best_n <= 0:
+        raise RuntimeError("No uploaded files found.")
+    return best
+
+
+def validate_paths(paths: List[str], label: str):
+    for p in paths:
+        if not os.path.isdir(p):
+            raise FileNotFoundError(f"{label} path missing: {p}")
+        _ = get_sorted_dicom_files(p)
 
 
 def read_bytes(path: str) -> bytes:
@@ -606,140 +634,83 @@ def read_bytes(path: str) -> bytes:
 
 
 def main() -> None:
-    st.set_page_config(page_title="Cancer DICOM GIF Generator", layout="wide")
-    st.title("Cancer DICOM Before/After GIF Generator")
-    st.caption("Uses cached model only: `model_cache/after_ae_model.keras`.")
+    st.set_page_config(page_title="Colab-Equivalent Before/After", layout="wide")
+    st.title("Colab-Equivalent Before/After GIF Generator")
+    st.caption("Uses fixed healthy reference folders `data/trial1..3` and one uploaded cancer case.")
 
     with st.sidebar:
-        st.subheader("Model")
-        model_path = st.text_input("Model path", value=DEFAULT_MODEL_PATH)
-        use_baseline = st.checkbox("Use precomputed healthy baseline", value=True)
-        baseline_path = st.text_input("Baseline path", value=DEFAULT_BASELINE_PATH)
-        baseline_weight = st.slider(
-            "Baseline score weight",
-            min_value=0.0,
-            max_value=1.0,
-            value=0.85,
-            step=0.05,
-            help="Final score = weight * baseline-diff + (1-weight) * model reconstruction error.",
-        )
+        st.subheader("Healthy Folders")
+        healthy_root = st.text_input("Healthy root", value=DEFAULT_HEALTHY_ROOT)
+        before_paths = [os.path.join(healthy_root, "trial1"), os.path.join(healthy_root, "trial2"), os.path.join(healthy_root, "trial3")]
+        after_paths = [os.path.join(healthy_root, "trial1"), os.path.join(healthy_root, "trial2"), os.path.join(healthy_root, "trial3")]
+        st.code("\n".join(before_paths), language="text")
 
-        st.subheader("Output")
-        output_root = st.text_input("Output root", value=DEFAULT_OUTPUT_ROOT)
-        fps = st.number_input("GIF FPS", min_value=1, max_value=30, value=12)
-        frame_stride = st.number_input("Treatment frame stride", min_value=1, max_value=30, value=6)
-        max_frames = st.number_input("Max GIF frames", min_value=30, max_value=2000, value=900)
-        max_slices = st.number_input("Max slices to process", min_value=20, max_value=1200, value=500)
+        st.subheader("GIF")
+        make_gif = st.checkbox("Generate GIFs", value=True)
+        fps = st.number_input("FPS", min_value=1, max_value=30, value=12)
+        frame_stride = st.number_input("Frame stride", min_value=1, max_value=30, value=6)
+        max_gif_frames = st.number_input("Max GIF frames", min_value=50, max_value=2000, value=900)
 
-        run_btn = st.button("Generate Before/After GIFs", type="primary", use_container_width=True)
+        output_root = st.text_input("Output root", value="outputs")
+        run_btn = st.button("Run Comparison", type="primary", use_container_width=True)
 
     uploads = st.file_uploader(
-        "Upload one cancer case (DICOM files and/or one ZIP)",
+        "Upload cancer DICOM files or ZIP (single case)",
         accept_multiple_files=True,
     )
 
     if not run_btn:
-        st.info("Upload one cancer case and click Generate Before/After GIFs.")
+        st.info("Upload cancer files and click Run Comparison.")
         return
 
     if not uploads:
-        st.error("Please upload cancer DICOM files first.")
-        return
-
-    model_abs = os.path.abspath(model_path)
-    if not os.path.exists(model_abs):
-        st.error(f"Model file not found: `{model_abs}`")
+        st.error("Please upload cancer files first.")
         return
 
     seed_everything(42)
+
+    try:
+        validate_paths(before_paths, "before")
+        validate_paths(after_paths, "after")
+    except Exception as e:
+        st.error(str(e))
+        st.info("Place healthy references in `data/trial1`, `data/trial2`, `data/trial3`.")
+        return
+
     run_id = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
     run_dir = os.path.join(output_root, run_id)
+    before_dir = os.path.join(run_dir, "before")
+    after_dir = os.path.join(run_dir, "after")
     upload_dir = os.path.join(run_dir, "uploaded_cancer")
     os.makedirs(run_dir, exist_ok=True)
-    t0 = time.time()
 
-    before_gif_path = os.path.join(run_dir, "before_treatment.gif")
-    after_gif_path = os.path.join(run_dir, "after_treatment.gif")
-
-    with st.status("Running model and rendering GIFs...", expanded=True) as status:
+    with st.status("Running Colab-equivalent pipelines...", expanded=True) as status:
         try:
-            st.write("Saving upload...")
-            cancer_dir = save_uploaded_files(uploads, upload_dir)
-            st.write(f"Cancer folder: `{cancer_dir}`")
+            st.write("Saving cancer upload...")
+            cancer_path = save_uploaded_cancer_folder(uploads, upload_dir)
+            st.write(f"Cancer folder: `{cancer_path}`")
 
-            st.write("Preparing slices...")
-            case = prepare_cancer_case(cancer_dir, max_slices=int(max_slices))
-            dicom_files = case["dicom_files"]
-
-            baseline_slices = None
-            baseline_abs = os.path.abspath(baseline_path)
-            if use_baseline:
-                st.write("Loading healthy baseline...")
-                if not os.path.exists(baseline_abs):
-                    raise FileNotFoundError(f"Baseline file not found: `{baseline_abs}`")
-                baseline_3d = load_baseline_cached(baseline_abs)
-                baseline_slices = prepare_baseline_for_case(
-                    baseline_3d=baseline_3d,
-                    target_shape=case["norm_slices"][0].shape,
-                    target_slices=len(case["norm_slices"]),
-                )
-
-            st.write("Loading model...")
-            model = load_model_cached(model_abs)
-
-            st.write("Detecting lesion regions...")
-            lesions = detect_lesions_with_model(
-                model=model,
-                norm_slices=case["norm_slices"],
-                valid_masks=case["valid_masks"],
-                baseline_slices=baseline_slices,
-                baseline_weight=float(baseline_weight),
-            )
-            active_map = build_active_map(lesions, case["gray_masks"], min_pixels=18)
-
-            st.write("Rendering BEFORE GIF...")
-            make_before_gif(
-                u8_slices=case["u8_slices"],
-                active_global=active_map,
-                gray_masks=case["gray_masks"],
-                out_path=before_gif_path,
-                fps=int(fps),
-                max_frames=int(max_frames),
-            )
-
-            st.write("Running treatment simulation and rendering AFTER GIF...")
-            lung3d = np.stack(case["lung_masks"], axis=0).astype(bool)
-            px_per_mm = max_lung_width_px(lung3d) / 300.0
-            px_radius = max(1, int(round((5.0 / 2.0) * px_per_mm)))
-            treatment = run_treatment_and_make_after_gif(
-                active_global=active_map,
-                u8_slices=case["u8_slices"],
-                gray_masks=case["gray_masks"],
-                out_path=after_gif_path,
-                px_radius=px_radius,
+            st.write("Running BEFORE...")
+            before = run_before(
+                cancer_path,
+                before_paths,
+                before_dir,
+                make_gif=make_gif,
                 fps=int(fps),
                 frame_stride=int(frame_stride),
-                max_frames=int(max_frames),
+                max_gif_frames=int(max_gif_frames),
             )
 
-            payload = {
-                "run_id": run_id,
-                "timestamp_utc": datetime.utcnow().isoformat() + "Z",
-                "model_path": model_abs,
-                "use_baseline": bool(use_baseline),
-                "baseline_path": baseline_abs if use_baseline else "",
-                "baseline_weight": float(baseline_weight),
-                "cancer_dir": cancer_dir,
-                "slices_processed": len(dicom_files),
-                "before_gif_path": before_gif_path,
-                "after_gif_path": after_gif_path,
-                "treatment_summary": treatment,
-                "beam_radius_px": int(px_radius),
-                "runtime_seconds": round(time.time() - t0, 2),
-            }
-            payload_path = os.path.join(run_dir, "model_output.json")
-            with open(payload_path, "w", encoding="utf-8") as f:
-                json.dump(payload, f, indent=2)
+            st.write("Running AFTER...")
+            after = run_after(
+                cancer_path,
+                after_paths,
+                after_dir,
+                make_gif=make_gif,
+                fps=int(fps),
+                frame_stride=int(frame_stride),
+                max_gif_frames=int(max_gif_frames),
+            )
 
             status.update(label="Completed", state="complete")
         except Exception as e:
@@ -749,26 +720,44 @@ def main() -> None:
 
     col1, col2 = st.columns(2)
     with col1:
-        st.subheader("Before GIF")
-        st.image(before_gif_path)
-        st.download_button(
-            "Download before_treatment.gif",
-            data=read_bytes(before_gif_path),
-            file_name="before_treatment.gif",
-            mime="image/gif",
-        )
+        st.subheader("Before")
+        if make_gif and os.path.exists(before["gif_path"]):
+            st.image(before["gif_path"])
+            st.download_button(
+                "Download before_treatment.gif",
+                data=read_bytes(before["gif_path"]),
+                file_name="before_treatment.gif",
+                mime="image/gif",
+            )
+        else:
+            st.info("Before GIF not generated.")
 
     with col2:
-        st.subheader("After GIF")
-        st.image(after_gif_path)
-        st.download_button(
-            "Download after_treatment.gif",
-            data=read_bytes(after_gif_path),
-            file_name="after_treatment.gif",
-            mime="image/gif",
-        )
+        st.subheader("After")
+        if make_gif and os.path.exists(after["gif_path"]):
+            st.image(after["gif_path"])
+            st.download_button(
+                "Download after_treatment.gif",
+                data=read_bytes(after["gif_path"]),
+                file_name="after_treatment.gif",
+                mime="image/gif",
+            )
+        else:
+            st.info("After GIF not generated.")
 
-    st.success(f"Done. GIFs saved under `{run_dir}`")
+    payload = {
+        "run_id": run_id,
+        "timestamp_utc": datetime.utcnow().isoformat() + "Z",
+        "healthy_root": healthy_root,
+        "cancer_path": cancer_path,
+        "before": before,
+        "after": after,
+    }
+    payload_path = os.path.join(run_dir, "model_output.json")
+    with open(payload_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+
+    st.success(f"Saved outputs to `{run_dir}`")
 
 
 if __name__ == "__main__":

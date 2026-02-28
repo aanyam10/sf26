@@ -5,4 +5,5 @@ scipy==1.11.4
 tensorflow-cpu==2.15.1; platform_system == "Linux"
 tensorflow-macos; platform_system == "Darwin" and platform_machine == "arm64"
 tensorflow==2.15.1; platform_system == "Darwin" and platform_machine == "x86_64"
+matplotlib==3.8.4
 pillow==10.4.0
