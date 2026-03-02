@@ -15,7 +15,6 @@ import matplotlib
 import numpy as np
 import pydicom
 import streamlit as st
-import tensorflow as tf
 from scipy import ndimage
 
 
@@ -41,7 +40,20 @@ DEFAULT_AFTER_PATHS = [
 def seed_everything(seed: int = 42) -> None:
     random.seed(seed)
     np.random.seed(seed)
-    tf.random.set_seed(seed)
+    try:
+        tf = get_tf()
+        tf.random.set_seed(seed)
+    except Exception:
+        # Allow app to load even if TF is unavailable until runtime.
+        pass
+
+
+def get_tf():
+    try:
+        import tensorflow as tf  # type: ignore
+    except Exception as e:
+        raise RuntimeError("TensorFlow is unavailable in this environment.") from e
+    return tf
 
 
 def get_sorted_dicom_files(folder: str) -> List[str]:
@@ -170,6 +182,7 @@ def run_treatment(
     frame_stride: int = 6,
     max_gif_frames: int = 900,
     laser_off_when_idle: bool = False,
+    static_overlay: bool = False,
 ):
     steps, treated = 0, 0
     initial = int(active_global.sum())
@@ -194,7 +207,7 @@ def run_treatment(
         first_bg = breath_seq[0]
         bg = ct_slices_u8[first_bg].astype(np.float32) / 255.0
         frame = np.repeat(bg[..., None], 3, axis=2)
-        visible = active_global & gray_masks[first_bg]
+        visible = active_global if static_overlay else (active_global & gray_masks[first_bg])
         frame[visible, 0] = 1.0
         frame[visible, 1] = 1.0
         frame[visible, 2] = 0.0
@@ -212,7 +225,7 @@ def run_treatment(
         def draw(background_idx, show_dot=False, laser_pos=(0, 0), laser_color="red"):
             bg0 = ct_slices_u8[background_idx].astype(np.float32) / 255.0
             rgb = np.repeat(bg0[..., None], 3, axis=2)
-            visible_overlay = active_global & gray_masks[background_idx]
+            visible_overlay = active_global if static_overlay else (active_global & gray_masks[background_idx])
             rgb[visible_overlay, 0] = 1.0
             rgb[visible_overlay, 1] = 1.0
             rgb[visible_overlay, 2] = 0.0
@@ -356,6 +369,7 @@ def run_before(cancer_path, healthy_paths, out_dir, make_gif=True, fps=12, frame
         frame_stride=frame_stride,
         max_gif_frames=max_gif_frames,
         laser_off_when_idle=False,
+        static_overlay=True,
     )
 
     csv_path = os.path.join(out_dir, "slice_detected_counts.csv")
@@ -407,6 +421,7 @@ def robust_positive_z(arr, valid):
 
 
 def build_ae(shape=(160, 160, 1), lr=1e-3):
+    tf = get_tf()
     i = tf.keras.layers.Input(shape=shape)
     x = tf.keras.layers.Conv2D(16, 3, strides=2, padding="same", activation="relu")(i)
     x = tf.keras.layers.Conv2D(32, 3, strides=2, padding="same", activation="relu")(x)
@@ -506,6 +521,7 @@ def run_after(cancer_path, healthy_paths, out_dir, make_gif=True, fps=12, frame_
     ae_err = np.zeros_like(diff_3d, dtype=np.float32)
 
     if healthy_ae:
+        tf = get_tf()
         x_train = np.stack(healthy_ae, axis=0).astype(np.float32)
         if x_train.shape[0] > 1200:
             idx = np.random.choice(x_train.shape[0], 1200, replace=False)
