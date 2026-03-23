@@ -660,8 +660,6 @@ def main() -> None:
         """,
         unsafe_allow_html=True,
     )
-    st.caption("Uses fixed healthy reference folders `data/trial1..3` and one uploaded cancer case.")
-
     with st.sidebar:
         st.subheader("Healthy Folders")
         healthy_root = st.text_input("Healthy root", value=DEFAULT_HEALTHY_ROOT)
