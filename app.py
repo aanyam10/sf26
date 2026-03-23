@@ -650,8 +650,12 @@ def read_bytes(path: str) -> bytes:
 
 
 def main() -> None:
-    st.set_page_config(page_title="Colab-Equivalent Before/After", layout="wide")
-    st.title("Colab-Equivalent Before/After GIF Generator")
+    st.set_page_config(page_title="PulmoSense", layout="wide")
+    st.title("PulmoSense")
+    st.markdown(
+        "Using CNN and Neurosymbolic AI To Prevent<br>Radiation-Induced Lung Injuries",
+        unsafe_allow_html=True,
+    )
     st.caption("Uses fixed healthy reference folders `data/trial1..3` and one uploaded cancer case.")
 
     with st.sidebar:
@@ -668,12 +672,12 @@ def main() -> None:
         max_gif_frames = st.number_input("Max GIF frames", min_value=50, max_value=2000, value=900)
 
         output_root = st.text_input("Output root", value="outputs")
-        run_btn = st.button("Run Comparison", type="primary", use_container_width=True)
 
     uploads = st.file_uploader(
         "Upload cancer DICOM files or ZIP (single case)",
         accept_multiple_files=True,
     )
+    run_btn = st.button("Run Comparison", type="primary", use_container_width=True)
 
     if not run_btn:
         st.info("Upload cancer files and click Run Comparison.")
