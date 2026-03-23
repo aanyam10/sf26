@@ -708,10 +708,12 @@ def main() -> None:
         """,
         unsafe_allow_html=True,
     )
-    run_btn = st.button("Perform Comparison", type="primary", use_container_width=False)
+    _, center_col, _ = st.columns([1, 1, 1])
+    with center_col:
+        run_btn = st.button("Perform Comparison", type="primary", use_container_width=False)
 
     if not run_btn:
-        st.info("Upload cancer files and click Run Comparison.")
+        st.info("Upload cancer files and click Perform Comparison.")
         return
 
     if not uploads:
