@@ -653,10 +653,13 @@ def main() -> None:
     st.set_page_config(page_title="PulmoSense", layout="wide")
     st.markdown(
         """
-        <h1 style="text-align:center; color:#003366; margin-bottom:0.2rem;">PulmoSense</h1>
-        <h3 style="text-align:center; color:#003366; margin-top:0;">
+        <h1 style="text-align:center; color:#003366; margin-bottom:0.05rem; line-height:1.1;">PulmoSense</h1>
+        <h3 style="text-align:center; color:#003366; margin-top:0; margin-bottom:0.2rem; line-height:1.15;">
             Using CNN and Neurosymbolic AI To Prevent Radiation-Induced Lung Injuries
         </h3>
+        <p style="text-align:center; color:#003366; margin-top:0; margin-bottom:0;">
+            WWSEF '26 - Aanya Mendapara
+        </p>
         """,
         unsafe_allow_html=True,
     )
