@@ -653,8 +653,8 @@ def main() -> None:
     st.set_page_config(page_title="PulmoSense", layout="wide")
     st.markdown(
         """
-        <h1 style="text-align:center; color:#008B8B; margin-bottom:0.2rem;">PulmoSense</h1>
-        <h3 style="text-align:center; color:#008B8B; margin-top:0;">
+        <h1 style="text-align:center; color:#003366; margin-bottom:0.2rem;">PulmoSense</h1>
+        <h3 style="text-align:center; color:#003366; margin-top:0;">
             Using CNN and Neurosymbolic AI To Prevent Radiation-Induced Lung Injuries
         </h3>
         """,
