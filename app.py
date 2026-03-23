@@ -687,7 +687,28 @@ def main() -> None:
         accept_multiple_files=True,
         label_visibility="collapsed",
     )
-    run_btn = st.button("Run Comparison", type="primary", use_container_width=True)
+    st.markdown(
+        """
+        <style>
+        div.stButton > button[kind="primary"] {
+            background-color: #7EC8FF !important;
+            color: #083B66 !important;
+            border: 1px solid #5EB5F2 !important;
+            border-radius: 8px !important;
+            padding: 0.25rem 0.9rem !important;
+            width: fit-content !important;
+            font-weight: 600 !important;
+        }
+        div.stButton > button[kind="primary"]:hover {
+            background-color: #6BBCFF !important;
+            border-color: #4AA7EA !important;
+            color: #062F52 !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    run_btn = st.button("Perform Comparison", type="primary", use_container_width=False)
 
     if not run_btn:
         st.info("Upload cancer files and click Run Comparison.")
