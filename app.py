@@ -690,6 +690,9 @@ def main() -> None:
     st.markdown(
         """
         <style>
+        div.stButton {
+            text-align: center !important;
+        }
         div.stButton > button[kind="primary"] {
             background-color: #7EC8FF !important;
             color: #083B66 !important;
@@ -698,6 +701,8 @@ def main() -> None:
             padding: 0.25rem 0.9rem !important;
             width: fit-content !important;
             font-weight: 600 !important;
+            margin: 0 auto !important;
+            display: inline-block !important;
         }
         div.stButton > button[kind="primary"]:hover {
             background-color: #6BBCFF !important;
@@ -708,9 +713,7 @@ def main() -> None:
         """,
         unsafe_allow_html=True,
     )
-    _, center_col, _ = st.columns([1, 1, 1])
-    with center_col:
-        run_btn = st.button("Perform Comparison", type="primary", use_container_width=False)
+    run_btn = st.button("Perform Comparison", type="primary", use_container_width=False)
 
     if not run_btn:
         st.info("Upload cancer files and click Perform Comparison.")
