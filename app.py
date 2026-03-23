@@ -655,7 +655,7 @@ def main() -> None:
         """
         <div style="text-align:center; color:#003366; font-family:'Helvetica Neue', Helvetica, Arial, sans-serif; line-height:1.1; margin:0;">
             <h1 style="margin:0; font-family:inherit; font-weight:700;">PulmoSense</h1>
-            <h3 style="margin:0.05rem 0 0 0; font-family:inherit; font-weight:600;">
+            <h3 style="margin:0.01rem 0 0 0; font-family:inherit; font-weight:600;">
                 Using CNN and Neurosymbolic AI To Prevent Radiation-Induced Lung Injuries
             </h3>
             <p style="margin:0.05rem 0 0 0; font-family:inherit; font-weight:500;">
