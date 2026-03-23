@@ -683,7 +683,7 @@ def main() -> None:
     st.markdown("<div style='height:0.65rem;'></div>", unsafe_allow_html=True)
     st.markdown(
         "<p style='font-size:1.05rem; font-weight:600; margin:0 0 0.35rem 0;'>"
-        "Upload cancer DICOM files"
+        "Upload cancer DICOM files and click Perform Comparison."
         "</p>",
         unsafe_allow_html=True,
     )
