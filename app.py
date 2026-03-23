@@ -653,13 +653,15 @@ def main() -> None:
     st.set_page_config(page_title="PulmoSense", layout="wide")
     st.markdown(
         """
-        <h1 style="text-align:center; color:#003366; margin-bottom:0.05rem; line-height:1.1;">PulmoSense</h1>
-        <h3 style="text-align:center; color:#003366; margin-top:0; margin-bottom:0.2rem; line-height:1.15;">
-            Using CNN and Neurosymbolic AI To Prevent Radiation-Induced Lung Injuries
-        </h3>
-        <p style="text-align:center; color:#003366; margin-top:0; margin-bottom:0;">
-            WWSEF '26 - Aanya Mendapara
-        </p>
+        <div style="text-align:center; color:#003366; font-family:'Helvetica Neue', Helvetica, Arial, sans-serif; line-height:1.1; margin:0;">
+            <h1 style="margin:0; font-family:inherit; font-weight:700;">PulmoSense</h1>
+            <h3 style="margin:0.05rem 0 0 0; font-family:inherit; font-weight:600;">
+                Using CNN and Neurosymbolic AI To Prevent Radiation-Induced Lung Injuries
+            </h3>
+            <p style="margin:0.05rem 0 0 0; font-family:inherit; font-weight:500;">
+                WWSEF '26 - Aanya Mendapara
+            </p>
+        </div>
         """,
         unsafe_allow_html=True,
     )
@@ -678,7 +680,7 @@ def main() -> None:
 
         output_root = st.text_input("Output root", value="outputs")
 
-    st.markdown("<div style='height:1.25rem;'></div>", unsafe_allow_html=True)
+    st.markdown("<div style='height:0.65rem;'></div>", unsafe_allow_html=True)
     st.markdown(
         "<p style='font-size:1.05rem; font-weight:600; margin:0 0 0.35rem 0;'>"
         "Upload cancer DICOM files"
