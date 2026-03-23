@@ -651,9 +651,13 @@ def read_bytes(path: str) -> bytes:
 
 def main() -> None:
     st.set_page_config(page_title="PulmoSense", layout="wide")
-    st.title("PulmoSense")
     st.markdown(
-        "Using CNN and Neurosymbolic AI To Prevent<br>Radiation-Induced Lung Injuries",
+        """
+        <h1 style="text-align:center; color:#008B8B; margin-bottom:0.2rem;">PulmoSense</h1>
+        <h3 style="text-align:center; color:#008B8B; margin-top:0;">
+            Using CNN and Neurosymbolic AI To Prevent Radiation-Induced Lung Injuries
+        </h3>
+        """,
         unsafe_allow_html=True,
     )
     st.caption("Uses fixed healthy reference folders `data/trial1..3` and one uploaded cancer case.")
