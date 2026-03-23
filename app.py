@@ -35,6 +35,17 @@ DEFAULT_AFTER_PATHS = [
     os.path.join(DEFAULT_HEALTHY_ROOT, "trial2"),
     os.path.join(DEFAULT_HEALTHY_ROOT, "trial3"),
 ]
+LOGO_CANDIDATES = [
+    os.path.join("assets", "pulmosense_logo.png"),
+    os.path.join("assets", "pulmosense_logo.jpg"),
+    os.path.join("assets", "pulmosense_logo.jpeg"),
+    os.path.join("assets", "logo.png"),
+    os.path.join("assets", "logo.jpg"),
+    os.path.join("assets", "logo.jpeg"),
+    "logo.png",
+    "logo.jpg",
+    "logo.jpeg",
+]
 
 
 def seed_everything(seed: int = 42) -> None:
@@ -649,8 +660,20 @@ def read_bytes(path: str) -> bytes:
         return f.read()
 
 
+def get_logo_path() -> str | None:
+    for path in LOGO_CANDIDATES:
+        if os.path.isfile(path):
+            return path
+    return None
+
+
 def main() -> None:
     st.set_page_config(page_title="PulmoSense", layout="wide")
+    logo_path = get_logo_path()
+    logo_col, _ = st.columns([1, 8])
+    with logo_col:
+        if logo_path:
+            st.image(logo_path, width=140)
     st.markdown(
         """
         <div style="text-align:center; color:#003366; font-family:'Helvetica Neue', Helvetica, Arial, sans-serif; line-height:1.1; margin:0;">
