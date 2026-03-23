@@ -676,9 +676,16 @@ def main() -> None:
         output_root = st.text_input("Output root", value="outputs")
 
     st.markdown("<div style='height:1.25rem;'></div>", unsafe_allow_html=True)
+    st.markdown(
+        "<p style='font-size:1.05rem; font-weight:600; margin:0 0 0.35rem 0;'>"
+        "Upload cancer DICOM files or ZIP (single case)"
+        "</p>",
+        unsafe_allow_html=True,
+    )
     uploads = st.file_uploader(
-        "Upload cancer DICOM files or ZIP (single case)",
+        "Upload cancer files",
         accept_multiple_files=True,
+        label_visibility="collapsed",
     )
     run_btn = st.button("Run Comparison", type="primary", use_container_width=True)
 
